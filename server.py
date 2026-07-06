@@ -16,7 +16,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(ROOT, "state.json")
-PORT = 8127
+PORT = int(os.environ.get("PORT", "8127"))
 
 
 class Handler(SimpleHTTPRequestHandler):

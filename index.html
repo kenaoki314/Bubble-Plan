@@ -103,6 +103,9 @@
     }
     .urgent-glow { animation: urgent-glow 2s ease-in-out infinite; }
     .link-path:hover { stroke: #f87171 !important; stroke-opacity: 1 !important; }
+    /* Dashes crawl from the prerequisite toward the task it blocks. */
+    @keyframes link-flow { to { stroke-dashoffset: -18; } }
+    .link-path { animation: link-flow 0.8s linear infinite; }
   </style>
 </head>
 
@@ -123,15 +126,17 @@
     const THEME_KEY = "taskmap.theme";
     const POMO_MS = 25 * 60 * 1000;
     const DAY_MS = 86400000;
-    const ZOOM_MIN = 0.2, ZOOM_MAX = 2, ZOOM_STEP = 1.2;
+    // The zoom badge shows zoom relative to ZOOM_INIT, so the home view reads
+    // as 100% — these bounds map to 25%…200% on the badge.
+    const ZOOM_MIN = 0.175, ZOOM_MAX = 1.4, ZOOM_STEP = 1.2;
     // Google Drive sync: state lives in a single JSON file in the hidden
     // appDataFolder of the signed-in account — invisible in Drive, app-only.
     const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
     const DRIVE_FILE = "spatial_tasks_state.json";
     const GOOGLE_CLIENT_KEY = "taskmap.google.clientId";
     const DRIVE_AUTOCONNECT_KEY = "taskmap.drive.autoconnect";
-    // Everything on the canvas is drawn at ~1.5× size, so the 70% home zoom
-    // reads like the original 100%. Start (and reset) there.
+    // Everything on the canvas is drawn at ~1.5× size; showing it at 0.7 is
+    // the intended reading size, so 0.7 is home — and is displayed as 100%.
     const ZOOM_INIT = 0.7;
 
     const PRIORITIES = {
@@ -168,6 +173,16 @@
       { dot: "bg-rose-400",    border: "border-rose-300/80 dark:border-rose-500/50",       bg: "bg-rose-100/30 dark:bg-rose-500/10",       text: "text-rose-600 dark:text-rose-300",       chip: "bg-rose-50 border-rose-200 dark:bg-rose-500/15 dark:border-rose-500/40" },
       { dot: "bg-amber-400",   border: "border-amber-300/80 dark:border-amber-500/50",     bg: "bg-amber-100/30 dark:bg-amber-500/10",     text: "text-amber-600 dark:text-amber-300",     chip: "bg-amber-50 border-amber-200 dark:bg-amber-500/15 dark:border-amber-500/40" },
     ];
+
+    // Zones have no manual resize — they start at the base size and auto-fit
+    // whatever tasks live in them.
+    const ZONE_MIN = { w: 750, h: 520 };
+    const ZONE_PAD = 50;     // zone edge -> card clearance
+    const ZONE_HEADER = 70;  // room for the header strip
+
+    // Plain hex twins of the tailwind palettes above — the minimap draws raw SVG.
+    const ZONE_HEX = ["#38bdf8", "#a78bfa", "#34d399", "#fb7185", "#fbbf24"];
+    const PRI_HEX = { critical: "#ef4444", high: "#fb923c", medium: "#facc15", low: "#60a5fa" };
 
     /* ============================ Helpers ============================ */
 
@@ -474,7 +489,7 @@
         <svg className="absolute inset-0" width={CANVAS.width} height={CANVAS.height} style={{ zIndex: 5, pointerEvents: "none" }}>
           <defs>
             <marker id="arrowhead" markerWidth="15" markerHeight="12" refX="13.5" refY="6" orient="auto">
-              <polygon points="0 0, 15 6, 0 12" fill="#60a5fa" opacity="0.9" />
+              <polygon points="0 0, 15 6, 0 12" fill="#f87171" opacity="0.95" />
             </marker>
           </defs>
           {links.map((l) => {
@@ -486,11 +501,32 @@
             const ex = c2.x - (dx / dist) * 158, ey = c2.y - (dy / dist) * 98;
             const mx = (sx + ex) / 2 - (dy / dist) * 42, my = (sy + ey) / 2 + (dx / dist) * 42;
             const d = `M ${sx} ${sy} Q ${mx} ${my} ${ex} ${ey}`;
+            // Direction cues that survive cards covering the endpoints: the
+            // stroke fades green (do first) → red (blocked), the dashes crawl
+            // toward the blocked task, and chevrons ride mid-path.
+            const q = (t) => ({
+              x: (1 - t) * (1 - t) * sx + 2 * (1 - t) * t * mx + t * t * ex,
+              y: (1 - t) * (1 - t) * sy + 2 * (1 - t) * t * my + t * t * ey,
+            });
+            const qAngle = (t) => {
+              const tx = 2 * (1 - t) * (mx - sx) + 2 * t * (ex - mx);
+              const ty = 2 * (1 - t) * (my - sy) + 2 * t * (ey - my);
+              return (Math.atan2(ty, tx) * 180) / Math.PI;
+            };
             return (
               <g key={l.id} style={{ pointerEvents: "auto", cursor: "pointer" }} onClick={() => onDeleteLink(l.id)}>
-                <title>Dependency: finish the first task before the arrow's target. Click to remove.</title>
+                <title>Dependency: the green end must be finished first — the arrows point at the task it blocks. Click to remove.</title>
+                <linearGradient id={`lg-${l.id}`} gradientUnits="userSpaceOnUse" x1={sx} y1={sy} x2={ex} y2={ey}>
+                  <stop offset="0%" stopColor="#34d399" />
+                  <stop offset="55%" stopColor="#fbbf24" />
+                  <stop offset="100%" stopColor="#f87171" />
+                </linearGradient>
                 <path d={d} fill="none" stroke="transparent" strokeWidth="24" />
-                <path d={d} className="link-path" fill="none" stroke="#60a5fa" strokeOpacity="0.7" strokeWidth="3" strokeDasharray="10 8" markerEnd="url(#arrowhead)" />
+                <path d={d} className="link-path" fill="none" stroke={`url(#lg-${l.id})`} strokeOpacity="0.85" strokeWidth="3.5" strokeDasharray="10 8" markerEnd="url(#arrowhead)" />
+                {[0.35, 0.65].map((t) => {
+                  const p = q(t);
+                  return <polygon key={t} points="-9,-7 7,0 -9,7" fill="#f87171" opacity="0.9" transform={`translate(${p.x} ${p.y}) rotate(${qAngle(t)})`} />;
+                })}
               </g>
             );
           })}
@@ -500,10 +536,9 @@
 
     /* ============================ Zones ============================== */
 
-    function Zone({ zone, count, priority, zoom, onPatch, onDelete, beginDrag, onDragTo, onDragState }) {
+    function Zone({ zone, count, priority, zoom, onPatch, onDelete, onAddTask, beginDrag, onDragTo, onDragState }) {
       const c = ZONE_COLORS[zone.color % ZONE_COLORS.length];
       const drag = useRef(null);
-      const resize = useRef(null);
       const [liveDrag, setLiveDrag] = useState(false);
 
       const endHeaderDrag = () => {
@@ -524,27 +559,6 @@
         if (!drag.current) return;
         if (e.buttons === 0) { endHeaderDrag(); return; } // button no longer held — never ghost-drag
         onDragTo(drag.current.snap, (e.clientX - drag.current.x0) / zoom, (e.clientY - drag.current.y0) / zoom);
-      };
-
-      const endResize = () => {
-        resize.current = null;
-        onDragState(false);
-      };
-      const resizeDown = (e) => {
-        if (e.button !== 0) return; // right button pans the map
-        e.preventDefault();
-        e.stopPropagation();
-        resize.current = { w: zone.w, h: zone.h, x0: e.clientX, y0: e.clientY };
-        onDragState(true);
-        capturePointer(e.currentTarget, e.pointerId);
-      };
-      const resizeMove = (e) => {
-        if (!resize.current) return;
-        if (e.buttons === 0) { endResize(); return; }
-        onPatch(zone.id, {
-          w: clamp(resize.current.w + (e.clientX - resize.current.x0) / zoom, 400, CANVAS.width - zone.x),
-          h: clamp(resize.current.h + (e.clientY - resize.current.y0) / zoom, 260, CANVAS.height - zone.y),
-        });
       };
 
       const header = (
@@ -574,6 +588,7 @@
             </span>
           )}
           <span className={`text-[15px] px-2.5 rounded-full border ${c.chip} ${c.text}`}>{count}</span>
+          <button onClick={() => onAddTask(zone.id)} title="Add a task straight into this zone" className={`text-xl leading-none px-1 font-semibold ${c.text} hover:opacity-60`}>＋</button>
           <button onClick={() => onDelete(zone.id)} title="Delete zone (keeps its tasks)" className="text-gray-300 hover:text-red-500 dark:text-slate-600 dark:hover:text-red-400 text-lg">✕</button>
         </div>
       );
@@ -606,19 +621,13 @@
           style={{ ...dragProps.style, left: zone.x, top: zone.y, width: zone.w, height: zone.h, zIndex: 2 }}
         >
           {header}
-          <div
-            onPointerDown={resizeDown} onPointerMove={resizeMove} onPointerUp={endResize} onPointerCancel={endResize}
-            className={`absolute bottom-0 right-0 w-9 h-9 cursor-se-resize rounded-tl-2xl border ${c.chip} opacity-50 hover:opacity-100`}
-            style={{ touchAction: "none" }}
-            title="Drag to resize"
-          ></div>
         </div>
       );
     }
 
     /* ====================== Task Modal (add/edit) ==================== */
 
-    function TaskModal({ initial, onSave, onClose }) {
+    function TaskModal({ initial, zoneName, onSave, onClose }) {
       const [title, setTitle] = useState(initial?.title || "");
       const [description, setDescription] = useState(initial?.description || "");
       const [priority, setPriority] = useState(initial?.priority || "medium");
@@ -650,7 +659,7 @@
       return (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-gray-900/20 dark:bg-black/50 backdrop-blur-sm" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
           <form onSubmit={submit} className="pop-in w-[440px] max-w-[92vw] rounded-3xl bg-white dark:bg-slate-900 p-7 shadow-2xl">
-            <h2 className="text-lg font-semibold mb-5 text-gray-900 dark:text-slate-100">{initial ? "Edit Task" : "New Task"}</h2>
+            <h2 className="text-lg font-semibold mb-5 text-gray-900 dark:text-slate-100">{initial ? "Edit Task" : zoneName ? <>New Task in “{zoneName}”</> : "New Task"}</h2>
 
             <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1.5">Title</label>
             <input ref={titleRef} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="What needs doing?" className={`${inputCls} mb-4`} />
@@ -832,6 +841,46 @@
               </div>
             </div>
           )}
+        </div>
+      );
+    }
+
+    /* ============================ Minimap ============================ */
+
+    // Whole-canvas overview pinned to the corner: zones as tinted boxes,
+    // tasks as priority-colored dots, plus the current viewport rectangle.
+    // Click or drag anywhere on it to fly the view there.
+    function MiniMap({ zones, tasks, view, onJump }) {
+      const W = 200, H = Math.round((W * CANVAS.height) / CANVAS.width);
+      const k = W / CANVAS.width;
+      const jump = (e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        onJump((e.clientX - r.left) / k, (e.clientY - r.top) / k);
+      };
+      return (
+        <div className="fixed bottom-[60px] right-4 z-[94] rounded-2xl bg-white/80 dark:bg-slate-900/85 backdrop-blur-md shadow-lg p-1.5 select-none" title="Overview — click or drag to move the view">
+          <svg
+            width={W} height={H} className="block rounded-xl cursor-crosshair"
+            style={{ touchAction: "none" }}
+            onPointerDown={(e) => { e.preventDefault(); capturePointer(e.currentTarget, e.pointerId); jump(e); }}
+            onPointerMove={(e) => { if (e.buttons & 1) jump(e); }}
+          >
+            <rect width={W} height={H} rx="10" fill="rgba(148, 163, 184, 0.12)" />
+            {zones.map((z) => {
+              const hex = ZONE_HEX[z.color % ZONE_HEX.length];
+              const w = z.collapsed ? 360 : z.w, h = z.collapsed ? 110 : z.h;
+              return <rect key={z.id} x={z.x * k} y={z.y * k} width={Math.max(3, w * k)} height={Math.max(3, h * k)} rx="1.5" fill={hex} fillOpacity="0.22" stroke={hex} strokeOpacity="0.65" strokeWidth="1" />;
+            })}
+            {tasks.map((t) => (
+              <circle key={t.id} cx={(t.x + priOf(t).width / 2) * k} cy={(t.y + 90) * k} r="2" fill={PRI_HEX[t.priority] || PRI_HEX.medium} />
+            ))}
+            {view && (
+              <rect
+                x={view.x * k} y={view.y * k} width={view.w * k} height={view.h * k} rx="2"
+                fill="rgba(59, 130, 246, 0.12)" stroke="#3b82f6" strokeWidth="1.5"
+              />
+            )}
+          </svg>
         </div>
       );
     }
@@ -1242,6 +1291,39 @@
         };
       };
 
+      /* ---- minimap: track the on-screen slice of the canvas ---- */
+      const [viewRect, setViewRect] = useState(null);
+      useEffect(() => {
+        const vp = viewportRef.current;
+        let raf = null;
+        const update = () => {
+          raf = null;
+          const cRect = canvasRef.current.getBoundingClientRect();
+          const vpRect = vp.getBoundingClientRect();
+          setViewRect({
+            x: (vpRect.left - cRect.left) / zoom,
+            y: (vpRect.top - cRect.top) / zoom,
+            w: vp.clientWidth / zoom,
+            h: vp.clientHeight / zoom,
+          });
+        };
+        const schedule = () => { if (!raf) raf = requestAnimationFrame(update); };
+        update();
+        vp.addEventListener("scroll", schedule);
+        window.addEventListener("resize", schedule);
+        return () => {
+          vp.removeEventListener("scroll", schedule);
+          window.removeEventListener("resize", schedule);
+          if (raf) cancelAnimationFrame(raf);
+        };
+      }, [zoom]);
+
+      const jumpTo = useCallback((cx, cy) => {
+        const vp = viewportRef.current;
+        vp.scrollLeft = cx * zoom - vp.clientWidth / 2;
+        vp.scrollTop = cy * zoom - vp.clientHeight / 2;
+      }, [zoom]);
+
       /* ---- persistence + Drive sync + clock + theme ---- */
       // localStorage saves instantly on every change (zero UI lag, offline
       // safe); Google Drive gets a debounced background copy so every device
@@ -1349,20 +1431,61 @@
 
       const timerTask = data.timer ? data.tasks.find((t) => t.id === data.timer.taskId) : null;
 
+      /* ---- zone auto-fit ---- */
+      const measureHeights = () => {
+        const h = {};
+        canvasRef.current?.querySelectorAll("[data-task-id]").forEach((el) => { h[el.dataset.taskId] = el.offsetHeight; });
+        return h;
+      };
+
+      // Zones can't be resized by hand — after every membership change each
+      // zone re-fits its tasks: growing to enclose them all, shrinking back
+      // toward the base size when they leave.
+      const fitZones = (d, cardH) => {
+        let changed = false;
+        const zones = d.zones.map((z) => {
+          if (z.collapsed) return z;
+          const m = d.tasks.filter((t) => !t.completed && t.zoneId === z.id);
+          let x = z.x, y = z.y, w = ZONE_MIN.w, h = ZONE_MIN.h;
+          if (m.length) {
+            const x2 = Math.max(...m.map((t) => t.x + priOf(t).width));
+            const y2 = Math.max(...m.map((t) => t.y + (cardH[t.id] || 220)));
+            x = Math.min(z.x, Math.min(...m.map((t) => t.x)) - ZONE_PAD);
+            y = Math.min(z.y, Math.min(...m.map((t) => t.y)) - ZONE_HEADER);
+            w = Math.max(ZONE_MIN.w, x2 + ZONE_PAD - x);
+            h = Math.max(ZONE_MIN.h, y2 + ZONE_PAD - y);
+          }
+          if (x !== z.x || y !== z.y || w !== z.w || h !== z.h) { changed = true; return { ...z, x, y, w, h }; }
+          return z;
+        });
+        return changed ? { ...d, zones } : d;
+      };
+
       /* ---- task ops ---- */
-      const addTask = (fields) => {
+      const addTask = (fields, zoneId) => {
+        const cardH = measureHeights();
         const c = viewCenter();
-        const cx = c.x - 180, cy = c.y - 90;
         const jitter = () => (Math.random() - 0.5) * 240;
         setData((d) => {
+          const z = zoneId ? d.zones.find((zz) => zz.id === zoneId) : null;
+          let x, y;
+          if (z) {
+            // stack under the zone's current tasks — fitZones grows the box
+            const m = d.tasks.filter((t) => !t.completed && t.zoneId === z.id);
+            x = z.x + ZONE_PAD;
+            y = m.length ? Math.max(...m.map((t) => t.y + (cardH[t.id] || 220))) + 45 : z.y + ZONE_HEADER + 20;
+          } else {
+            x = c.x - 180 + jitter();
+            y = c.y - 90 + jitter();
+          }
           const t = {
             id: uid(), ...fields,
-            x: clamp(cx + jitter(), 0, CANVAS.width - 420),
-            y: clamp(cy + jitter(), 0, CANVAS.height - 240),
+            x: clamp(x, 0, CANVAS.width - 420),
+            y: clamp(y, 0, CANVAS.height - 240),
             completed: false, pomodoros: 0, subtasks: [], createdAt: Date.now(),
           };
-          t.zoneId = zoneIdAt(t, d.zones);
-          return { ...d, tasks: [...d.tasks, t] };
+          t.zoneId = z ? z.id : zoneIdAt(t, d.zones);
+          return fitZones({ ...d, tasks: [...d.tasks, t] }, cardH);
         });
       };
 
@@ -1370,32 +1493,43 @@
         setData((d) => ({ ...d, tasks: d.tasks.map((t) => (t.id === id ? { ...t, x, y } : t)) }));
       }, []);
 
-      // A drag ended: the card keeps the zone it was dropped into (or none).
+      // A drag ended: the card keeps the zone it was dropped into (or none),
+      // and every zone re-fits around its members.
       const dropTask = useCallback((id) => {
-        setData((d) => ({
+        const cardH = measureHeights();
+        setData((d) => fitZones({
           ...d,
           tasks: d.tasks.map((t) => (t.id === id ? { ...t, zoneId: zoneIdAt(t, d.zones) } : t)),
-        }));
+        }, cardH));
       }, []);
 
       const updateTask = useCallback((id, fn) => {
         setData((d) => ({ ...d, tasks: d.tasks.map((t) => (t.id === id ? fn(t) : t)) }));
       }, []);
 
-      const completeTask = (id) => setData((d) => ({
-        ...d,
-        tasks: d.tasks.map((t) => (t.id === id ? { ...t, completed: true, completedAt: Date.now() } : t)),
-        history: [...d.history, { t: Date.now(), title: d.tasks.find((t) => t.id === id)?.title || "" }].slice(-500),
-        timer: d.timer?.taskId === id ? null : d.timer,
-      }));
+      const completeTask = (id) => {
+        const cardH = measureHeights();
+        setData((d) => fitZones({
+          ...d,
+          tasks: d.tasks.map((t) => (t.id === id ? { ...t, completed: true, completedAt: Date.now() } : t)),
+          history: [...d.history, { t: Date.now(), title: d.tasks.find((t) => t.id === id)?.title || "" }].slice(-500),
+          timer: d.timer?.taskId === id ? null : d.timer,
+        }, cardH));
+      };
 
-      const restoreTask = (id) => setData((d) => ({ ...d, tasks: d.tasks.map((t) => (t.id === id ? { ...t, completed: false } : t)) }));
-      const deleteTask = (id) => setData((d) => ({
-        ...d,
-        tasks: d.tasks.filter((t) => t.id !== id),
-        links: d.links.filter((l) => l.from !== id && l.to !== id),
-        timer: d.timer?.taskId === id ? null : d.timer,
-      }));
+      const restoreTask = (id) => {
+        const cardH = measureHeights();
+        setData((d) => fitZones({ ...d, tasks: d.tasks.map((t) => (t.id === id ? { ...t, completed: false } : t)) }, cardH));
+      };
+      const deleteTask = (id) => {
+        const cardH = measureHeights();
+        setData((d) => fitZones({
+          ...d,
+          tasks: d.tasks.filter((t) => t.id !== id),
+          links: d.links.filter((l) => l.from !== id && l.to !== id),
+          timer: d.timer?.taskId === id ? null : d.timer,
+        }, cardH));
+      };
       const clearDone = () => setData((d) => ({ ...d, tasks: d.tasks.filter((t) => !t.completed) }));
 
       /* ---- links ---- */
@@ -1417,13 +1551,20 @@
           ...d,
           zones: [...d.zones, {
             id: uid(), name: "New Zone", collapsed: false,
-            x: clamp(c.x - 375, 0, CANVAS.width - 750),
-            y: clamp(c.y - 260, 0, CANVAS.height - 520),
-            w: 750, h: 520, color: d.zones.length % ZONE_COLORS.length,
+            x: clamp(c.x - ZONE_MIN.w / 2, 0, CANVAS.width - ZONE_MIN.w),
+            y: clamp(c.y - ZONE_MIN.h / 2, 0, CANVAS.height - ZONE_MIN.h),
+            w: ZONE_MIN.w, h: ZONE_MIN.h, color: d.zones.length % ZONE_COLORS.length,
           }],
         }));
       };
-      const patchZone = (id, patch) => setData((d) => ({ ...d, zones: d.zones.map((z) => (z.id === id ? { ...z, ...patch } : z)) }));
+      const patchZone = (id, patch) => {
+        // expanding a collapsed zone re-fits it around its (possibly moved) tasks
+        const cardH = patch.collapsed === false ? measureHeights() : null;
+        setData((d) => {
+          const next = { ...d, zones: d.zones.map((z) => (z.id === id ? { ...z, ...patch } : z)) };
+          return cardH ? fitZones(next, cardH) : next;
+        });
+      };
       const deleteZone = (id) => setData((d) => ({
         ...d,
         zones: d.zones.filter((z) => z.id !== id),
@@ -1505,7 +1646,11 @@
             m.sort((a, b) => dep[a.id] - dep[b.id] || priOf(a).rank - priOf(b).rank || a.createdAt - b.createdAt);
             const avg = m.length ? m.reduce((s, t) => s + priOf(t).rank, 0) / m.length : 3.5;
             if (z.collapsed) return { kind: "zone", z, m, avg, w: 360, h: 110, collapsed: true };
-            const w = Math.max(z.w, Math.max(0, ...m.map((t) => priOf(t).width)) + PAD * 2);
+            // width scales with the task count (≈ square packing) — zone sizes
+            // are derived from their contents, never from a stored user size
+            const maxW = Math.max(0, ...m.map((t) => priOf(t).width));
+            const cols = Math.max(1, Math.ceil(Math.sqrt(m.length)));
+            const w = Math.max(ZONE_MIN.w, cols * (maxW + CARD_GAP) - CARD_GAP + PAD * 2);
             let cx = PAD, cy = HEADER, rowH = 0, bottom = HEADER;
             const rel = m.map((t) => {
               const cw = priOf(t).width, ch = hOf(t);
@@ -1516,7 +1661,7 @@
               rowH = Math.max(rowH, ch);
               return r;
             });
-            const h = m.length ? Math.max(z.h, bottom + PAD) : z.h;
+            const h = m.length ? Math.max(ZONE_MIN.h, bottom + PAD) : ZONE_MIN.h;
             return { kind: "zone", z, m, avg, w, h, rel };
           });
 
@@ -1775,6 +1920,27 @@
         vp.scrollTo({ left: CENTER.x * zoom - vp.clientWidth / 2, top: CENTER.y * zoom - vp.clientHeight / 2, behavior: "smooth" });
       };
 
+      /* ---- hotkeys: N new task · L link · Z zone · A arrange ---- */
+      // The handlers close over fresh state each render; the ref lets a
+      // once-registered listener always call the latest ones.
+      const hotkeys = useRef({});
+      hotkeys.current = { addZone, autoArrange, canLink: active.length >= 2, canArrange: active.length > 0, busy: !!modal };
+      useEffect(() => {
+        const onKey = (e) => {
+          if (e.ctrlKey || e.metaKey || e.altKey) return;
+          if (e.target.closest("input, textarea, select, [contenteditable]")) return;
+          const h = hotkeys.current;
+          if (h.busy) return;
+          const k = e.key.toLowerCase();
+          if (k === "n" || k === "t") { e.preventDefault(); setModal({}); }
+          else if (k === "l") { if (h.canLink) { e.preventDefault(); setLinkStep((s) => (s ? null : "from")); } }
+          else if (k === "z") { e.preventDefault(); h.addZone(); }
+          else if (k === "a") { if (h.canArrange) { e.preventDefault(); h.autoArrange(); } }
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, []);
+
       /* ---- render ---- */
       const HeaderBtn = ({ onClick, active: isActive, disabled, children, title }) => (
         <button
@@ -1810,14 +1976,14 @@
 
             <div className="flex-1"></div>
 
-            <HeaderBtn onClick={() => setLinkStep(linkStep ? null : "from")} active={!!linkStep} disabled={active.length < 2} title="Link two tasks as a dependency">Link</HeaderBtn>
-            <HeaderBtn onClick={addZone} title="Add a grouping zone to the map">Zone</HeaderBtn>
+            <HeaderBtn onClick={() => setLinkStep(linkStep ? null : "from")} active={!!linkStep} disabled={active.length < 2} title="Link two tasks as a dependency (L)">Link</HeaderBtn>
+            <HeaderBtn onClick={addZone} title="Add a grouping zone to the map (Z)">Zone</HeaderBtn>
             <HeaderBtn onClick={() => setFocusMode((v) => !v)} active={focusMode} title="Dim everything except critical tasks and the active focus session">Focus</HeaderBtn>
-            <HeaderBtn onClick={autoArrange} disabled={active.length === 0} title="Arrange by priority: critical at the center, lower priority further out (zones move by the average priority of their tasks)">Arrange</HeaderBtn>
+            <HeaderBtn onClick={autoArrange} disabled={active.length === 0} title="Arrange by priority: critical at the center, lower priority further out — zones move by the average priority of their tasks (A)">Arrange</HeaderBtn>
             <HeaderBtn onClick={() => { setShowStats((v) => !v); }} active={showStats} title="Daily velocity and workload stats">Stats</HeaderBtn>
             <HeaderBtn onClick={() => setShowDone((v) => !v)} active={showDone} title="Completed tasks">✓ {done.length}</HeaderBtn>
             <HeaderBtn onClick={() => setDark((v) => !v)} title={dark ? "Switch to light mode" : "Switch to dark mode"}>{dark ? "☀️" : "🌙"}</HeaderBtn>
-            <button onClick={() => setModal({})} className="ml-1 px-4 py-1.5 text-[13px] font-semibold rounded-full bg-blue-500 text-white hover:bg-blue-600 transition-colors shadow-sm">+ New Task</button>
+            <button onClick={() => setModal({})} title="Add a task (N)" className="ml-1 px-4 py-1.5 text-[13px] font-semibold rounded-full bg-blue-500 text-white hover:bg-blue-600 transition-colors shadow-sm">+ New Task</button>
           </header>
 
           {/* ---------- Link-mode banner ---------- */}
@@ -1850,6 +2016,7 @@
                   count={members.length}
                   priority={avg === null ? null : ["critical", "high", "medium", "low"][clamp(Math.round(avg), 0, 3)]}
                   onPatch={patchZone} onDelete={deleteZone}
+                  onAddTask={(zid) => setModal({ zoneId: zid })}
                   beginDrag={beginZoneDrag} onDragTo={dragZoneTo}
                   onDragState={setZoneDragging}
                 />
@@ -1881,6 +2048,9 @@
             </div>
           </div>
 
+          {/* ---------- Minimap ---------- */}
+          <MiniMap zones={data.zones} tasks={active} view={viewRect} onJump={jumpTo} />
+
           {/* ---------- Zoom controls ---------- */}
           <div className="fixed bottom-4 right-4 z-[95] flex items-center gap-0.5 rounded-full bg-white/80 dark:bg-slate-900/85 backdrop-blur-md shadow-lg px-1.5 py-1 select-none">
             <button
@@ -1890,9 +2060,9 @@
             >−</button>
             <button
               onClick={() => applyZoom(() => ZOOM_INIT)}
-              title="Reset zoom to 70% (Ctrl 0)"
+              title="Reset zoom to 100% (Ctrl 0)"
               className="min-w-[44px] px-1 py-1 text-[11px] font-medium tabular-nums rounded-full text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800 transition-colors"
-            >{Math.round(zoom * 100)}%</button>
+            >{Math.round((zoom / ZOOM_INIT) * 100)}%</button>
             <button
               onClick={() => applyZoom((p) => p * ZOOM_STEP)} disabled={zoom >= ZOOM_MAX}
               title="Zoom in (scroll up, or Ctrl +)"
@@ -1904,9 +2074,10 @@
           {modal && (
             <TaskModal
               initial={modal.task || null}
+              zoneName={modal.zoneId ? (data.zones.find((z) => z.id === modal.zoneId)?.name || null) : null}
               onSave={(fields) => {
                 if (modal.task) updateTask(modal.task.id, (t) => ({ ...t, ...fields }));
-                else addTask(fields);
+                else addTask(fields, modal.zoneId);
                 setModal(null);
               }}
               onClose={() => setModal(null)}
