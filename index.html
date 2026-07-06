@@ -179,6 +179,7 @@
     const ZONE_MIN = { w: 750, h: 520 };
     const ZONE_PAD = 50;     // zone edge -> card clearance
     const ZONE_HEADER = 70;  // room for the header strip
+    const ZONE_GAP = 40;     // zones may never overlap — minimum box-to-box clearance
 
     // Plain hex twins of the tailwind palettes above — the minimap draws raw SVG.
     const ZONE_HEX = ["#38bdf8", "#a78bfa", "#34d399", "#fb7185", "#fbbf24"];
@@ -1213,9 +1214,33 @@
         });
       }, []);
 
+      // Programmatic camera: fly to a canvas point at a given zoom — used by
+      // Arrange's zoom-to-fit. When the zoom actually changes, the layout
+      // effect below re-aims the scroll right after the canvas rescales.
+      const cameraTarget = useRef(null);
+      const flyTo = (cx, cy, z) => {
+        const zc = clamp(z, ZOOM_MIN, ZOOM_MAX);
+        if (Math.abs(zc - zoom) < 0.0005) {
+          const vp = viewportRef.current;
+          vp.scrollTo({ left: cx * zc - vp.clientWidth / 2, top: cy * zc - vp.clientHeight / 2, behavior: "smooth" });
+        } else {
+          cameraTarget.current = { cx, cy };
+          setZoom(zc);
+        }
+      };
+
       // Re-aim the scroll position after the canvas rescales, before paint,
       // so the anchored point doesn't visibly jump.
       useLayoutEffect(() => {
+        const cam = cameraTarget.current;
+        if (cam) {
+          cameraTarget.current = null;
+          zoomAnchor.current = null;
+          const vp = viewportRef.current;
+          vp.scrollLeft = cam.cx * zoom - vp.clientWidth / 2;
+          vp.scrollTop = cam.cy * zoom - vp.clientHeight / 2;
+          return;
+        }
         const a = zoomAnchor.current;
         if (!a) return;
         zoomAnchor.current = null;
@@ -1473,7 +1498,46 @@
           if (x !== z.x || y !== z.y || w !== z.w || h !== z.h) { changed = true; return { ...z, x, y, w, h }; }
           return z;
         });
-        return changed ? { ...d, zones } : d;
+        // Zones may never overlap: if a re-fit grew one into a neighbor,
+        // push the boxes apart minimally — member tasks travel along.
+        const eff = (z) => ({ x: z.x, y: z.y, w: z.collapsed ? 360 : z.w, h: z.collapsed ? 110 : z.h });
+        const home = zones.map((z) => ({ x: z.x, y: z.y }));
+        const zs = zones.map((z) => ({ ...z }));
+        for (let iter = 0; iter < 30; iter++) {
+          let any = false;
+          for (let i = 0; i < zs.length; i++) {
+            for (let j = i + 1; j < zs.length; j++) {
+              const A = eff(zs[i]), B = eff(zs[j]);
+              const ox = Math.min(A.x + A.w, B.x + B.w) - Math.max(A.x, B.x) + ZONE_GAP;
+              const oy = Math.min(A.y + A.h, B.y + B.h) - Math.max(A.y, B.y) + ZONE_GAP;
+              if (ox <= 0 || oy <= 0) continue;
+              any = true;
+              if (ox < oy) {
+                const s = A.x + A.w / 2 <= B.x + B.w / 2 ? 1 : -1;
+                zs[i].x = clamp(zs[i].x - (s * ox) / 2, 0, CANVAS.width - A.w);
+                zs[j].x = clamp(zs[j].x + (s * ox) / 2, 0, CANVAS.width - B.w);
+              } else {
+                const s = A.y + A.h / 2 <= B.y + B.h / 2 ? 1 : -1;
+                zs[i].y = clamp(zs[i].y - (s * oy) / 2, 0, CANVAS.height - A.h);
+                zs[j].y = clamp(zs[j].y + (s * oy) / 2, 0, CANVAS.height - B.h);
+              }
+            }
+          }
+          if (!any) break;
+        }
+        const shift = {};
+        zs.forEach((z, i) => {
+          const dx = z.x - home[i].x, dy = z.y - home[i].y;
+          if (dx || dy) { shift[z.id] = { dx, dy }; changed = true; }
+        });
+        if (!changed) return d;
+        const tasks = Object.keys(shift).length
+          ? d.tasks.map((t) => {
+              const s = t.zoneId && shift[t.zoneId];
+              return s ? { ...t, x: clamp(t.x + s.dx, 0, CANVAS.width - 420), y: clamp(t.y + s.dy, 0, CANVAS.height - 240) } : t;
+            })
+          : d.tasks;
+        return { ...d, zones: zs, tasks };
       };
 
       /* ---- task ops ---- */
@@ -1560,17 +1624,38 @@
       const deleteLink = (id) => setData((d) => ({ ...d, links: d.links.filter((l) => l.id !== id) }));
 
       /* ---- zones ---- */
-      const addZone = () => {
-        const c = viewCenter();
-        setData((d) => ({
-          ...d,
-          zones: [...d.zones, {
-            id: uid(), name: "New Zone", collapsed: false,
-            x: clamp(c.x - ZONE_MIN.w / 2, 0, CANVAS.width - ZONE_MIN.w),
-            y: clamp(c.y - ZONE_MIN.h / 2, 0, CANVAS.height - ZONE_MIN.h),
-            w: ZONE_MIN.w, h: ZONE_MIN.h, color: d.zones.length % ZONE_COLORS.length,
-          }],
-        }));
+      // `at` (canvas point) places the zone near the cursor (Z hotkey);
+      // without it — e.g. the header button — the view center is used.
+      const addZone = (at) => {
+        const c = at ? { x: clamp(at.x, 0, CANVAS.width), y: clamp(at.y, 0, CANVAS.height) } : viewCenter();
+        setData((d) => {
+          // new zone lands at the nearest overlap-free spot to the view center
+          const eff = (z) => ({ x: z.x, y: z.y, w: z.collapsed ? 360 : z.w, h: z.collapsed ? 110 : z.h });
+          const free = (x, y) => !d.zones.some((z) => {
+            const r = eff(z);
+            return x < r.x + r.w + ZONE_GAP && r.x < x + ZONE_MIN.w + ZONE_GAP && y < r.y + r.h + ZONE_GAP && r.y < y + ZONE_MIN.h + ZONE_GAP;
+          });
+          let x = clamp(c.x - ZONE_MIN.w / 2, 0, CANVAS.width - ZONE_MIN.w);
+          let y = clamp(c.y - ZONE_MIN.h / 2, 0, CANVAS.height - ZONE_MIN.h);
+          if (!free(x, y)) {
+            search: for (let r = 180; r < 9000; r += 150) {
+              const steps = Math.max(8, Math.floor(r / 90));
+              for (let s = 0; s < steps; s++) {
+                const a = (2 * Math.PI * s) / steps;
+                const nx = clamp(c.x + r * Math.cos(a) - ZONE_MIN.w / 2, 0, CANVAS.width - ZONE_MIN.w);
+                const ny = clamp(c.y + r * Math.sin(a) * 0.85 - ZONE_MIN.h / 2, 0, CANVAS.height - ZONE_MIN.h);
+                if (free(nx, ny)) { x = nx; y = ny; break search; }
+              }
+            }
+          }
+          return {
+            ...d,
+            zones: [...d.zones, {
+              id: uid(), name: "New Zone", collapsed: false,
+              x, y, w: ZONE_MIN.w, h: ZONE_MIN.h, color: d.zones.length % ZONE_COLORS.length,
+            }],
+          };
+        });
       };
       const patchZone = (id, patch) => {
         // expanding a collapsed zone re-fits it around its (possibly moved) tasks
@@ -1595,14 +1680,34 @@
         };
       };
       const dragZoneTo = (snap, dX, dY) => {
-        setData((d) => ({
-          ...d,
-          zones: d.zones.map((z) => (z.id === snap.zoneId ? { ...z, x: clamp(snap.zx + dX, 0, CANVAS.width - snap.zw), y: clamp(snap.zy + dY, 0, CANVAS.height - snap.zh) } : z)),
-          tasks: d.tasks.map((t) => {
-            const m = snap.members.find((m) => m.id === t.id);
-            return m ? { ...t, x: clamp(m.x + dX, 0, CANVAS.width - 420), y: clamp(m.y + dY, 0, CANVAS.height - 240) } : t;
-          }),
-        }));
+        setData((d) => {
+          // zones may never overlap: a dragged zone slides along the edge of
+          // any zone it runs into instead of passing through it
+          const me = d.zones.find((z) => z.id === snap.zoneId);
+          if (!me) return d;
+          const effW = me.collapsed ? 360 : snap.zw, effH = me.collapsed ? 110 : snap.zh;
+          const others = d.zones.filter((z) => z.id !== snap.zoneId);
+          const hits = (x, y) => others.some((z) => {
+            const r = { x: z.x, y: z.y, w: z.collapsed ? 360 : z.w, h: z.collapsed ? 110 : z.h };
+            return x < r.x + r.w + ZONE_GAP && r.x < x + effW + ZONE_GAP && y < r.y + r.h + ZONE_GAP && r.y < y + effH + ZONE_GAP;
+          });
+          let nx = clamp(snap.zx + dX, 0, CANVAS.width - snap.zw);
+          let ny = clamp(snap.zy + dY, 0, CANVAS.height - snap.zh);
+          if (hits(nx, ny)) {
+            if (!hits(nx, me.y)) ny = me.y;       // blocked vertically — slide sideways
+            else if (!hits(me.x, ny)) nx = me.x;  // blocked horizontally — slide up/down
+            else { nx = me.x; ny = me.y; }        // cornered — stay put
+          }
+          const aX = nx - snap.zx, aY = ny - snap.zy; // the delta that actually applied
+          return {
+            ...d,
+            zones: d.zones.map((z) => (z.id === snap.zoneId ? { ...z, x: nx, y: ny } : z)),
+            tasks: d.tasks.map((t) => {
+              const m = snap.members.find((m) => m.id === t.id);
+              return m ? { ...t, x: clamp(m.x + aX, 0, CANVAS.width - 420), y: clamp(m.y + aY, 0, CANVAS.height - 240) } : t;
+            }),
+          };
+        });
       };
 
       /* ---- timer ---- */
@@ -1612,29 +1717,33 @@
       const stopTimer = () => setData((d) => ({ ...d, timer: null }));
 
       /* ---- auto arrange ----
-             Scattered, hand-placed feel — nothing lines up on a grid:
-             1. Each zone packs its cards loosely (wide gaps, jittered),
+             A compacting tidy-up — everything gathers around the hot center
+             while keeping its bearing (what was north-east stays north-east):
+             1. Each zone re-packs its cards (loose grid, light jitter),
                 growing so nothing bleeds over its edges.
-             2. Chains of linked loose tasks are laid out left→right by
-                dependency depth, so arrows flow forward instead of tangling.
-             3. Zones AND chains drop onto a spiral around the hot center at
-                random angles — first collision-free spot wins, so placement
-                looks random while clearance stays guaranteed. Higher-priority
-                blocks go first and land closer in.
-             4. Remaining loose tasks scatter into the space beyond, sampled
-                at random until they find a spot with generous personal space
-                (closer in for critical, further out for low priority).
+             2. Chains of linked loose tasks re-form left→right by dependency
+                depth.
+             3. Blocks (zones and chains) slide inward toward the center
+                along their own bearing until they'd touch something already
+                placed — the board becomes one cluster, without overlaps.
+             4. Loose single tasks pull in the same way, settling around the
+                blocks.
              5. A repair pass nudges cards out of every link's corridor so no
                 arrow cuts through an unrelated card — zone members only ever
-                move within their own zone, never out of it. ---- */
+                move within their own zone, never out of it.
+             Afterwards the camera zooms out just enough to fit the cluster
+             and centers on it. ---- */
       const autoArrange = () => {
         // Real rendered card heights — cards vary with content.
         const cardH = {};
         canvasRef.current.querySelectorAll("[data-task-id]").forEach((el) => { cardH[el.dataset.taskId] = el.offsetHeight; });
         const rnd = (a) => (Math.random() * 2 - 1) * a;
 
-        setData((d) => {
-          const GAP = 240;      // guaranteed clearance between zone/chain blocks
+        // computed outside the state updater so the camera can fit the
+        // finished layout afterwards
+        {
+          const d = dataRef.current;
+          const GAP = 120;      // minimum clearance kept between zone/chain blocks
           const PAD = 50;       // zone edge -> card clearance
           const HEADER = 70;    // room for the zone header strip
           const CARD_GAP = 55;
@@ -1660,8 +1769,7 @@
               if (!ch) break;
             }
             m.sort((a, b) => dep[a.id] - dep[b.id] || priOf(a).rank - priOf(b).rank || a.createdAt - b.createdAt);
-            const avg = m.length ? m.reduce((s, t) => s + priOf(t).rank, 0) / m.length : 3.5;
-            if (z.collapsed) return { kind: "zone", z, m, avg, w: 360, h: 110, collapsed: true };
+            if (z.collapsed) return { kind: "zone", z, m, w: 360, h: 110, collapsed: true };
             // width scales with the task count (≈ square packing) — zone sizes
             // are derived from their contents, never from a stored user size
             const maxW = Math.max(0, ...m.map((t) => priOf(t).width));
@@ -1678,7 +1786,7 @@
               return r;
             });
             const h = m.length ? Math.max(ZONE_MIN.h, bottom + PAD) : ZONE_MIN.h;
-            return { kind: "zone", z, m, avg, w, h, rel };
+            return { kind: "zone", z, m, w, h, rel };
           });
 
           // --- 2. linked loose tasks → left-to-right dependency chains ---
@@ -1734,36 +1842,33 @@
               });
               x += colW[ci] + COL_GAP;
             });
-            const avg = m.reduce((s, t) => s + priOf(t).rank, 0) / m.length;
-            chainBlocks.push({ kind: "chain", m, avg, w: x - COL_GAP, h: blockH, rel });
+            chainBlocks.push({ kind: "chain", m, w: x - COL_GAP, h: blockH, rel });
           });
 
-          // --- 3. drop blocks onto a randomized spiral around the center ---
-          // Critical-heavy blocks place first, so they claim the inner spots.
-          // Each candidate ring is probed starting from a random angle; the
-          // first spot with GAP clearance from everything already placed
-          // wins. Random angles → nothing shares an edge line, ever.
-          const blocks = [...zoneBlocks, ...chainBlocks].sort((a, b) => a.avg - b.avg);
+          // --- 3. compact: blocks slide in toward the hot center ---
+          // Every block keeps its bearing from the center but pulls inward
+          // as far as it can without touching anything already placed —
+          // arranging gathers the whole board into one cluster around the
+          // hot zone. Closest blocks go first and claim the inner spots.
+          const blocks = [...zoneBlocks, ...chainBlocks];
+          blocks.forEach((b) => {
+            const ax = b.kind === "zone" ? b.z.x + b.w / 2 : b.m.reduce((s, t) => s + t.x, 0) / b.m.length;
+            const ay = b.kind === "zone" ? b.z.y + b.h / 2 : b.m.reduce((s, t) => s + t.y, 0) / b.m.length;
+            b.dist = Math.hypot(ax - CENTER.x, ay - CENTER.y);
+            b.angle = b.dist < 1 ? Math.random() * 2 * Math.PI : Math.atan2(ay - CENTER.y, ax - CENTER.x);
+          });
+          blocks.sort((a, b) => a.dist - b.dist);
           const placed = []; // {x, y, w, h} of settled blocks
           const blockCollides = (x, y, w, h) =>
             placed.some((p) => x < p.x + p.w + GAP && p.x < x + w + GAP && y < p.y + p.h + GAP && p.y < y + h + GAP);
-          blocks.forEach((b, bi) => {
-            let bx = CENTER.x - b.w / 2 + rnd(140), by = CENTER.y - b.h / 2 + rnd(120);
-            if (bi > 0 || blockCollides(bx, by, b.w, b.h)) {
-              search: for (let r = 200; r < 9000; r += 110) {
-                const a0 = Math.random() * 2 * Math.PI;
-                const steps = Math.max(9, Math.floor(r / 70));
-                for (let s = 0; s < steps; s++) {
-                  const a = a0 + (2 * Math.PI * s) / steps;
-                  // mild vertical squash: screens are wider than tall
-                  const x = CENTER.x + r * Math.cos(a) - b.w / 2 + rnd(45);
-                  const y = CENTER.y + r * Math.sin(a) * 0.85 - b.h / 2 + rnd(45);
-                  if (!blockCollides(x, y, b.w, b.h)) { bx = x; by = y; break search; }
-                }
-              }
+          blocks.forEach((b) => {
+            let bx = clamp(CENTER.x - b.w / 2, 0, CANVAS.width - b.w);
+            let by = clamp(CENTER.y - b.h / 2, 0, CANVAS.height - b.h);
+            for (let r = 0; r < 14000; r += 40) {
+              bx = clamp(CENTER.x + Math.cos(b.angle) * r - b.w / 2, 0, CANVAS.width - b.w);
+              by = clamp(CENTER.y + Math.sin(b.angle) * r - b.h / 2, 0, CANVAS.height - b.h);
+              if (!blockCollides(bx, by, b.w, b.h)) break;
             }
-            bx = clamp(bx, 0, CANVAS.width - b.w);
-            by = clamp(by, 0, CANVAS.height - b.h);
             placed.push({ x: bx, y: by, w: b.w, h: b.h });
             if (b.kind === "zone") {
               zonePatch[b.z.id] = b.collapsed ? { x: bx, y: by } : { x: bx, y: by, w: b.w, h: b.h };
@@ -1778,46 +1883,26 @@
             }
           });
 
-          // --- 4. singles scatter into the space beyond the blocks ---
-          // Rejection sampling in a rank-dependent annulus: random spots are
-          // tried until one has ≥150px of personal space from every block
-          // and every already-placed single. Random, but never crowded.
-          const blockR = placed.length
-            ? Math.max(...placed.flatMap((p) => [
-                Math.hypot(p.x - CENTER.x, p.y - CENTER.y),
-                Math.hypot(p.x + p.w - CENTER.x, p.y - CENTER.y),
-                Math.hypot(p.x - CENTER.x, p.y + p.h - CENTER.y),
-                Math.hypot(p.x + p.w - CENTER.x, p.y + p.h - CENTER.y),
-              ]))
-            : 0;
+          // --- 4. loose singles pull in the same way, around the blocks ---
           const solids = placed.map((p) => ({ ...p }));
-          const SPACE = 150; // personal space around every loose card
-          singles.sort((a, b) => priOf(a).rank - priOf(b).rank || a.createdAt - b.createdAt);
-          singles.forEach((t) => {
-            const w = priOf(t).width, h = hOf(t);
-            let base = (blockR ? blockR + 150 : 100) + priOf(t).rank * 330;
-            let pos = null;
-            for (let round = 0; round < 6 && !pos; round++, base += 380) {
-              for (let att = 0; att < 70; att++) {
-                const rr = base + Math.random() * 450;
-                const aa = Math.random() * 2 * Math.PI;
-                const x = clamp(CENTER.x + rr * Math.cos(aa) - w / 2, 0, CANVAS.width - 420);
-                const y = clamp(CENTER.y + rr * Math.sin(aa) * 0.8 - h / 2, 0, CANVAS.height - 240);
-                if (!solids.some((p) => x < p.x + p.w + SPACE && p.x < x + w + SPACE && y < p.y + p.h + SPACE && p.y < y + h + SPACE)) {
-                  pos = { x, y };
-                  break;
-                }
+          const SPACE = 60; // personal space around every loose card
+          singles
+            .map((t) => {
+              const dist = Math.hypot(t.x - CENTER.x, t.y - CENTER.y);
+              return { t, dist, angle: dist < 1 ? Math.random() * 2 * Math.PI : Math.atan2(t.y - CENTER.y, t.x - CENTER.x) };
+            })
+            .sort((a, b) => a.dist - b.dist)
+            .forEach(({ t, angle }) => {
+              const w = priOf(t).width, h = hOf(t);
+              let x = t.x, y = t.y;
+              for (let r = 0; r < 14000; r += 35) {
+                x = clamp(CENTER.x + Math.cos(angle) * r - w / 2, 0, CANVAS.width - 420);
+                y = clamp(CENTER.y + Math.sin(angle) * r - h / 2, 0, CANVAS.height - 240);
+                if (!solids.some((p) => x < p.x + p.w + SPACE && p.x < x + w + SPACE && y < p.y + p.h + SPACE && p.y < y + h + SPACE)) break;
               }
-            }
-            if (!pos) { // pathological board: just land somewhere reasonable
-              pos = {
-                x: clamp(CENTER.x + rnd(3200) - w / 2, 0, CANVAS.width - 420),
-                y: clamp(CENTER.y + rnd(2600) - h / 2, 0, CANVAS.height - 240),
-              };
-            }
-            target[t.id] = pos;
-            solids.push({ x: pos.x, y: pos.y, w, h });
-          });
+              target[t.id] = { x, y };
+              solids.push({ x, y, w, h });
+            });
 
           // --- 5. repair pass: keep arrows out of unrelated cards ---
           // Every violation is fixed by RELOCATING the obstructing card to a
@@ -1908,21 +1993,24 @@
                   if (okSpot(id, x, y, true)) { target[id] = { x, y }; return true; }
                 }
                 if (grow < 2) {
+                  // total growth stays under the block gap, so zones can't
+                  // be grown into each other
                   const zr2 = zoneRectOf(home);
-                  zonePatch[home.id] = { x: zr2.x, y: zr2.y, w: zr2.w, h: zr2.h + 100 };
+                  zonePatch[home.id] = { x: zr2.x, y: zr2.y, w: zr2.w, h: zr2.h + 50 };
                 }
               }
               // no clear in-zone spot — the member stays where it is rather
               // than being thrown out of its zone
               return false;
             }
-            // open space: widening rings of random spots — the canvas is huge
-            // and corridors are finite, so a clear spot always exists
-            for (let base = 300; base < 12000; base += 450) {
+            // open space NEAR the card: widening rings around its own spot,
+            // so a repair never flings a card across the map
+            const p0 = posOf(id);
+            for (let base = 150; base < 8000; base += 350) {
               for (let att = 0; att < 60; att++) {
-                const rr = base + Math.random() * 450, aa = Math.random() * 2 * Math.PI;
-                const x = clamp(CENTER.x + rr * Math.cos(aa) - w / 2, 0, CANVAS.width - 420);
-                const y = clamp(CENTER.y + rr * Math.sin(aa) * 0.85 - h / 2, 0, CANVAS.height - 240);
+                const rr = base + Math.random() * 350, aa = Math.random() * 2 * Math.PI;
+                const x = clamp(p0.x + rr * Math.cos(aa), 0, CANVAS.width - 420);
+                const y = clamp(p0.y + rr * Math.sin(aa) * 0.85, 0, CANVAS.height - 240);
                 if (okSpot(id, x, y, false)) { target[id] = { x, y }; return true; }
               }
             }
@@ -1943,17 +2031,49 @@
             const moved = target[t.id] ? { ...t, ...target[t.id] } : t;
             return moved.completed ? moved : { ...moved, zoneId: zoneIdAt(moved, zonesNext) };
           });
-          return { ...d, zones: zonesNext, tasks: tasksNext };
-        });
-        const vp = viewportRef.current;
-        vp.scrollTo({ left: CENTER.x * zoom - vp.clientWidth / 2, top: CENTER.y * zoom - vp.clientHeight / 2, behavior: "smooth" });
+          setData({ ...d, zones: zonesNext, tasks: tasksNext });
+
+          // camera: zoom out just enough (never past 100%) to fit the whole
+          // cluster, and center on it
+          let bx1 = Infinity, by1 = Infinity, bx2 = -Infinity, by2 = -Infinity;
+          tasksNext.forEach((t) => {
+            if (t.completed || hiddenIn.has(t.id)) return;
+            bx1 = Math.min(bx1, t.x); by1 = Math.min(by1, t.y);
+            bx2 = Math.max(bx2, t.x + priOf(t).width); by2 = Math.max(by2, t.y + (cardH[t.id] || 220));
+          });
+          zonesNext.forEach((z) => {
+            const w = z.collapsed ? 360 : z.w, h = z.collapsed ? 110 : z.h;
+            bx1 = Math.min(bx1, z.x); by1 = Math.min(by1, z.y);
+            bx2 = Math.max(bx2, z.x + w); by2 = Math.max(by2, z.y + h);
+          });
+          if (bx2 > bx1) {
+            const vp = viewportRef.current;
+            const PADV = 160; // canvas-space breathing room around the cluster
+            const zFit = Math.min(vp.clientWidth / (bx2 - bx1 + PADV * 2), vp.clientHeight / (by2 - by1 + PADV * 2), ZOOM_INIT);
+            flyTo((bx1 + bx2) / 2, (by1 + by2) / 2, zFit);
+          }
+        }
       };
 
       /* ---- hotkeys: N new task · L link · Z zone · A arrange ---- */
       // The handlers close over fresh state each render; the ref lets a
       // once-registered listener always call the latest ones.
+      const mouse = useRef(null); // last cursor position — Z drops the zone there
       const hotkeys = useRef({});
-      hotkeys.current = { addZone, autoArrange, canLink: active.length >= 2, canArrange: active.length > 0, busy: !!modal };
+      hotkeys.current = {
+        addZone, autoArrange,
+        canLink: active.length >= 2, canArrange: active.length > 0, busy: !!modal,
+        cursorPoint: () => {
+          if (!mouse.current) return undefined;
+          const r = canvasRef.current.getBoundingClientRect();
+          return { x: (mouse.current.x - r.left) / zoom, y: (mouse.current.y - r.top) / zoom };
+        },
+      };
+      useEffect(() => {
+        const onMove = (e) => { mouse.current = { x: e.clientX, y: e.clientY }; };
+        window.addEventListener("pointermove", onMove);
+        return () => window.removeEventListener("pointermove", onMove);
+      }, []);
       useEffect(() => {
         const onKey = (e) => {
           if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -1963,7 +2083,7 @@
           const k = e.key.toLowerCase();
           if (k === "n" || k === "t") { e.preventDefault(); setModal({}); }
           else if (k === "l") { if (h.canLink) { e.preventDefault(); setLinkStep((s) => (s ? null : "from")); } }
-          else if (k === "z") { e.preventDefault(); h.addZone(); }
+          else if (k === "z") { e.preventDefault(); h.addZone(h.cursorPoint()); }
           else if (k === "a") { if (h.canArrange) { e.preventDefault(); h.autoArrange(); } }
         };
         window.addEventListener("keydown", onKey);
@@ -2006,9 +2126,9 @@
             <div className="flex-1"></div>
 
             <HeaderBtn onClick={() => setLinkStep(linkStep ? null : "from")} active={!!linkStep} disabled={active.length < 2} title="Link two tasks as a dependency (L)">Link</HeaderBtn>
-            <HeaderBtn onClick={addZone} title="Add a grouping zone to the map (Z)">Zone</HeaderBtn>
+            <HeaderBtn onClick={() => addZone()} title="Add a grouping zone to the map (Z drops one at the cursor)">Zone</HeaderBtn>
             <HeaderBtn onClick={() => setFocusMode((v) => !v)} active={focusMode} title="Dim everything except critical tasks and the active focus session">Focus</HeaderBtn>
-            <HeaderBtn onClick={autoArrange} disabled={active.length === 0} title="Arrange by priority: critical at the center, lower priority further out — zones move by the average priority of their tasks (A)">Arrange</HeaderBtn>
+            <HeaderBtn onClick={autoArrange} disabled={active.length === 0} title="Tidy up: pull everything into one cluster around the center, keeping relative positions, then zoom to fit (A)">Arrange</HeaderBtn>
             <HeaderBtn onClick={() => { setShowStats((v) => !v); }} active={showStats} title="Daily velocity and workload stats">Stats</HeaderBtn>
             <HeaderBtn onClick={() => setShowDone((v) => !v)} active={showDone} title="Completed tasks">✓ {done.length}</HeaderBtn>
             <HeaderBtn onClick={() => setDark((v) => !v)} title={dark ? "Switch to light mode" : "Switch to dark mode"}>{dark ? "☀️" : "🌙"}</HeaderBtn>
