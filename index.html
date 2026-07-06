@@ -1404,7 +1404,11 @@
               const dx = CENTER.x - c.x, dy = CENTER.y - c.y, dist = Math.hypot(dx, dy);
               if (dist < 420) return t;
               changed = true;
-              return { ...t, x: t.x + (dx / dist) * step, y: t.y + (dy / dist) * step };
+              const moved = { ...t, x: t.x + (dx / dist) * step, y: t.y + (dy / dist) * step };
+              // drifting out of its zone releases the task, like a manual drop
+              const home = moved.zoneId && d.zones.find((z) => z.id === moved.zoneId);
+              if (home && !insideZone(moved, home)) moved.zoneId = null;
+              return moved;
             });
             return changed ? { ...d, tasks } : d;
           });
@@ -1621,7 +1625,8 @@
                 at random until they find a spot with generous personal space
                 (closer in for critical, further out for low priority).
              5. A repair pass nudges cards out of every link's corridor so no
-                arrow cuts through an unrelated card. ---- */
+                arrow cuts through an unrelated card — zone members only ever
+                move within their own zone, never out of it. ---- */
       const autoArrange = () => {
         // Real rendered card heights — cards vary with content.
         const cardH = {};
@@ -1814,14 +1819,18 @@
             solids.push({ x: pos.x, y: pos.y, w, h });
           });
 
-          // --- 5. hard guarantee: no arrow may cross an unrelated card ---
+          // --- 5. repair pass: keep arrows out of unrelated cards ---
           // Every violation is fixed by RELOCATING the obstructing card to a
           // freshly sampled spot that is provably clear: spaced from every
           // card, outside every corridor, and with its own links' corridors
           // (from the new spot) crossing no one. A successful relocation can
-          // therefore never create a new violation, so each round strictly
-          // shrinks the violation set until it reaches zero.
+          // never create a new violation, so each round shrinks the
+          // violation set. One hard rule trumps arrow purity: a zone member
+          // is only ever moved WITHIN its zone — if no clear in-zone spot
+          // exists, the card stays and the arrow may pass over it.
           const hiddenIn = new Set(zoneBlocks.filter((b) => b.collapsed).flatMap((b) => b.m.map((t) => t.id)));
+          const zoneOfMember = {}; // membership as packed above, not raw zoneId
+          zoneBlocks.forEach((b) => b.m.forEach((t) => { zoneOfMember[t.id] = b.z; }));
           const visible = activeT.filter((t) => !hiddenIn.has(t.id));
           const visLinks = links.filter((l) => !hiddenIn.has(l.from) && !hiddenIn.has(l.to));
           const posOf = (id) => target[id] || { x: byId[id].x, y: byId[id].y };
@@ -1887,7 +1896,7 @@
           const relocate = (id) => {
             const t = byId[id];
             const w = priOf(t).width, h = hOf(t);
-            const home = t.zoneId ? d.zones.find((z) => z.id === t.zoneId) : null;
+            const home = zoneOfMember[id] || null;
             if (home && !home.collapsed) {
               // try to stay inside the home zone, stretching it a bit if cramped
               // (growth stays under the block gap, so zones still can't touch)
@@ -1896,13 +1905,16 @@
                 for (let att = 0; att < 90; att++) {
                   const x = zr.x + PAD + Math.random() * Math.max(1, zr.w - w - PAD * 2);
                   const y = zr.y + HEADER + Math.random() * Math.max(1, zr.h - h - HEADER - PAD);
-                  if (okSpot(id, x, y, true)) { target[id] = { x, y }; return; }
+                  if (okSpot(id, x, y, true)) { target[id] = { x, y }; return true; }
                 }
                 if (grow < 2) {
                   const zr2 = zoneRectOf(home);
                   zonePatch[home.id] = { x: zr2.x, y: zr2.y, w: zr2.w, h: zr2.h + 100 };
                 }
               }
+              // no clear in-zone spot — the member stays where it is rather
+              // than being thrown out of its zone
+              return false;
             }
             // open space: widening rings of random spots — the canvas is huge
             // and corridors are finite, so a clear spot always exists
@@ -1911,21 +1923,27 @@
                 const rr = base + Math.random() * 450, aa = Math.random() * 2 * Math.PI;
                 const x = clamp(CENTER.x + rr * Math.cos(aa) - w / 2, 0, CANVAS.width - 420);
                 const y = clamp(CENTER.y + rr * Math.sin(aa) * 0.85 - h / 2, 0, CANVAS.height - 240);
-                if (okSpot(id, x, y, false)) { target[id] = { x, y }; return; }
+                if (okSpot(id, x, y, false)) { target[id] = { x, y }; return true; }
               }
             }
+            return false;
           };
+          const stuck = new Set(); // unfixable — tolerate their violations
           for (let round = 0; round < 20; round++) {
-            const bad = violations();
+            const bad = violations().filter((id) => !stuck.has(id));
             if (!bad.length) break;
-            bad.forEach(relocate);
+            bad.forEach((id) => { if (!relocate(id)) stuck.add(id); });
           }
 
-          return {
-            ...d,
-            zones: d.zones.map((z) => (zonePatch[z.id] ? { ...z, ...zonePatch[z.id] } : z)),
-            tasks: d.tasks.map((t) => (target[t.id] ? { ...t, ...target[t.id] } : t)),
-          };
+          const zonesNext = d.zones.map((z) => (zonePatch[z.id] ? { ...z, ...zonePatch[z.id] } : z));
+          // Re-sync membership to where cards actually landed — the corridor
+          // repair pass may have pushed one out of its zone, and a stale
+          // zoneId would make the auto-fit stretch the zone across the map.
+          const tasksNext = d.tasks.map((t) => {
+            const moved = target[t.id] ? { ...t, ...target[t.id] } : t;
+            return moved.completed ? moved : { ...moved, zoneId: zoneIdAt(moved, zonesNext) };
+          });
+          return { ...d, zones: zonesNext, tasks: tasksNext };
         });
         const vp = viewportRef.current;
         vp.scrollTo({ left: CENTER.x * zoom - vp.clientWidth / 2, top: CENTER.y * zoom - vp.clientHeight / 2, behavior: "smooth" });
