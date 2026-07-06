@@ -1,14 +1,7 @@
-# entropy — Spatial Task Manager
+Spatial Task Manager
 
 A visual, map-based task manager. Tasks live as draggable cards on a 2D canvas instead of a list.
 
-## Run it
-
-Everything is in a single file — no install, no build step:
-
-- **Easiest:** double-click `index.html` (needs internet for the React/Tailwind CDNs).
-- **Local server:** `python -m http.server 8123` in this folder, then open http://localhost:8123
-- **CodeSandbox / v0:** paste the contents of `index.html` into a static HTML sandbox.
 
 ## Features
 
