@@ -1,0 +1,1929 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>entropy — Spatial Task Manager</title>
+
+  <!-- React 18 + Babel (JSX in the browser) + Tailwind Play CDN -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Google Identity Services — used for Google Drive sync -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script>
+    tailwind.config = { darkMode: "class" };
+    // Apply saved (or OS-preferred) theme before first paint to avoid a flash
+    try {
+      const t = localStorage.getItem("taskmap.theme");
+      if (t === "dark" || (!t && window.matchMedia("(prefers-color-scheme: dark)").matches)) {
+        document.documentElement.classList.add("dark");
+      }
+    } catch (e) {}
+  </script>
+
+  <!-- Inter, falling back to San Francisco / system-ui -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    html { color-scheme: light; }
+    html.dark { color-scheme: dark; }
+    body {
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    /* Whiteboard dot grid + a soft warm glow at the center: the "hot zone".
+       Priority radiates outward — important work lives near the middle. */
+    .map-grid {
+      background-color: #fafafa;
+      background-image:
+        radial-gradient(circle 1080px at 11000px 7500px, rgba(239, 68, 68, 0.055), rgba(251, 146, 60, 0.035) 45%, rgba(250, 250, 250, 0) 72%),
+        radial-gradient(circle, rgba(107, 114, 128, 0.16) 1.5px, transparent 1.5px),
+        radial-gradient(circle, rgba(107, 114, 128, 0.06) 1.5px, transparent 1.5px);
+      background-size: auto, 48px 48px, 12px 12px;
+      transition: background-color 0.3s ease;
+    }
+    html.dark .map-grid {
+      background-color: #070b14;
+      background-image:
+        radial-gradient(circle 1080px at 11000px 7500px, rgba(239, 68, 68, 0.12), rgba(251, 146, 60, 0.05) 45%, rgba(7, 11, 20, 0) 72%),
+        radial-gradient(circle, rgba(148, 163, 184, 0.14) 1.5px, transparent 1.5px),
+        radial-gradient(circle, rgba(148, 163, 184, 0.05) 1.5px, transparent 1.5px);
+    }
+
+    .task-card {
+      transition:
+        left 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+        top 0.5s cubic-bezier(0.22, 1, 0.36, 1),
+        transform 0.2s ease,
+        box-shadow 0.2s ease,
+        opacity 0.3s ease,
+        filter 0.3s ease;
+    }
+    .task-card.dragging { transition: transform 0.2s ease, box-shadow 0.2s ease; cursor: grabbing; }
+    .task-card:not(.dragging) { cursor: grab; }
+    /* While a zone is being dragged, member cards must track the mouse 1:1 —
+       no position easing, or they lag behind the zone. */
+    .zone-dragging .task-card { transition: opacity 0.3s ease, filter 0.3s ease; }
+    .zone-box { transition: left 0.15s ease-out, top 0.15s ease-out; }
+    .zone-box.live-drag { transition: none; }
+
+    /* The area around the canvas (visible when fully zoomed out) keeps the
+       whiteboard look instead of reading as dead space. */
+    .map-viewport {
+      background-color: #fafafa;
+      background-image: radial-gradient(circle, rgba(107, 114, 128, 0.08) 1px, transparent 1px);
+      background-size: 24px 24px;
+    }
+    html.dark .map-viewport {
+      background-color: #070b14;
+      background-image: radial-gradient(circle, rgba(148, 163, 184, 0.07) 1px, transparent 1px);
+    }
+
+    .map-viewport::-webkit-scrollbar { width: 10px; height: 10px; }
+    .map-viewport::-webkit-scrollbar-track { background: #f4f4f5; }
+    .map-viewport::-webkit-scrollbar-thumb { background: #d4d4d8; border-radius: 6px; }
+    .map-viewport::-webkit-scrollbar-thumb:hover { background: #a1a1aa; }
+    .map-viewport::-webkit-scrollbar-corner { background: #f4f4f5; }
+    html.dark .map-viewport::-webkit-scrollbar-track { background: #0b1120; }
+    html.dark .map-viewport::-webkit-scrollbar-thumb { background: #1e293b; }
+    html.dark .map-viewport::-webkit-scrollbar-thumb:hover { background: #334155; }
+    html.dark .map-viewport::-webkit-scrollbar-corner { background: #0b1120; }
+
+    @keyframes pop-in { from { opacity: 0; transform: scale(0.85); } to { opacity: 1; transform: scale(1); } }
+    .pop-in { animation: pop-in 0.25s ease-out; }
+    @keyframes urgent-glow {
+      0%, 100% { box-shadow: 0 4px 16px -2px rgba(239, 68, 68, 0.25); }
+      50% { box-shadow: 0 6px 24px 0px rgba(239, 68, 68, 0.45); }
+    }
+    .urgent-glow { animation: urgent-glow 2s ease-in-out infinite; }
+    .link-path:hover { stroke: #f87171 !important; stroke-opacity: 1 !important; }
+  </style>
+</head>
+
+<body class="bg-gray-50 text-gray-900 dark:bg-slate-950 dark:text-slate-100 overflow-hidden">
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } = React;
+
+    /* ============================ Config ============================ */
+
+    // 10× the original 2200×1500 board — roomy, but small enough that you
+    // can't get lost: the 20% zoom floor still shows a meaningful chunk of it.
+    const CANVAS = { width: 22000, height: 15000 };
+    const CENTER = { x: 11000, y: 7500 }; // matches the warm glow in .map-grid
+    const STORAGE_KEY = "taskmap.state.v2";
+    const LEGACY_KEY = "taskmap.tasks.v1";
+    const THEME_KEY = "taskmap.theme";
+    const POMO_MS = 25 * 60 * 1000;
+    const DAY_MS = 86400000;
+    const ZOOM_MIN = 0.2, ZOOM_MAX = 2, ZOOM_STEP = 1.2;
+    // Google Drive sync: state lives in a single JSON file in the hidden
+    // appDataFolder of the signed-in account — invisible in Drive, app-only.
+    const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
+    const DRIVE_FILE = "spatial_tasks_state.json";
+    const GOOGLE_CLIENT_KEY = "taskmap.google.clientId";
+    const DRIVE_AUTOCONNECT_KEY = "taskmap.drive.autoconnect";
+    // Everything on the canvas is drawn at ~1.5× size, so the 70% home zoom
+    // reads like the original 100%. Start (and reset) there.
+    const ZOOM_INIT = 0.7;
+
+    const PRIORITIES = {
+      critical: {
+        label: "Critical", rank: 0, width: 396,
+        badge: "bg-red-50 text-red-600 dark:bg-red-500/15 dark:text-red-300",
+        dot: "bg-red-500 dark:bg-red-400",
+        button: "bg-red-50 text-red-600 hover:bg-red-100 dark:bg-red-500/15 dark:text-red-300 dark:hover:bg-red-500/25",
+      },
+      high: {
+        label: "High", rank: 1, width: 366,
+        badge: "bg-orange-50 text-orange-600 dark:bg-orange-500/15 dark:text-orange-300",
+        dot: "bg-orange-400",
+        button: "bg-orange-50 text-orange-600 hover:bg-orange-100 dark:bg-orange-500/15 dark:text-orange-300 dark:hover:bg-orange-500/25",
+      },
+      medium: {
+        label: "Medium", rank: 2, width: 354,
+        badge: "bg-yellow-50 text-yellow-700 dark:bg-yellow-500/15 dark:text-yellow-300",
+        dot: "bg-yellow-400",
+        button: "bg-yellow-50 text-yellow-700 hover:bg-yellow-100 dark:bg-yellow-500/15 dark:text-yellow-300 dark:hover:bg-yellow-500/25",
+      },
+      low: {
+        label: "Low", rank: 3, width: 336,
+        badge: "bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-300",
+        dot: "bg-blue-400",
+        button: "bg-blue-50 text-blue-600 hover:bg-blue-100 dark:bg-blue-500/15 dark:text-blue-300 dark:hover:bg-blue-500/25",
+      },
+    };
+
+    const ZONE_COLORS = [
+      { dot: "bg-sky-400",     border: "border-sky-300/80 dark:border-sky-500/50",         bg: "bg-sky-100/30 dark:bg-sky-500/10",         text: "text-sky-600 dark:text-sky-300",         chip: "bg-sky-50 border-sky-200 dark:bg-sky-500/15 dark:border-sky-500/40" },
+      { dot: "bg-violet-400",  border: "border-violet-300/80 dark:border-violet-500/50",   bg: "bg-violet-100/30 dark:bg-violet-500/10",   text: "text-violet-600 dark:text-violet-300",   chip: "bg-violet-50 border-violet-200 dark:bg-violet-500/15 dark:border-violet-500/40" },
+      { dot: "bg-emerald-400", border: "border-emerald-300/80 dark:border-emerald-500/50", bg: "bg-emerald-100/30 dark:bg-emerald-500/10", text: "text-emerald-600 dark:text-emerald-300", chip: "bg-emerald-50 border-emerald-200 dark:bg-emerald-500/15 dark:border-emerald-500/40" },
+      { dot: "bg-rose-400",    border: "border-rose-300/80 dark:border-rose-500/50",       bg: "bg-rose-100/30 dark:bg-rose-500/10",       text: "text-rose-600 dark:text-rose-300",       chip: "bg-rose-50 border-rose-200 dark:bg-rose-500/15 dark:border-rose-500/40" },
+      { dot: "bg-amber-400",   border: "border-amber-300/80 dark:border-amber-500/50",     bg: "bg-amber-100/30 dark:bg-amber-500/10",     text: "text-amber-600 dark:text-amber-300",     chip: "bg-amber-50 border-amber-200 dark:bg-amber-500/15 dark:border-amber-500/40" },
+    ];
+
+    /* ============================ Helpers ============================ */
+
+    const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()));
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const priOf = (t) => PRIORITIES[t.priority] || PRIORITIES.medium;
+    const centerOf = (t) => ({ x: t.x + priOf(t).width / 2, y: t.y + 90 });
+    const insideZone = (t, z) => {
+      const c = centerOf(t);
+      return c.x >= z.x && c.x <= z.x + z.w && c.y >= z.y && c.y <= z.y + z.h;
+    };
+    // Zone membership is an explicit assignment (set when a task is dropped),
+    // not just geometric overlap — so overlapping zones can't steal each
+    // other's tasks when dragged. Smallest containing zone wins on drop.
+    const zoneIdAt = (t, zones) => {
+      const containing = zones.filter((z) => insideZone(t, z));
+      if (!containing.length) return null;
+      return containing.sort((a, b) => a.w * a.h - b.w * b.h)[0].id;
+    };
+    const memberOf = (t, z) => t.zoneId === z.id && insideZone(t, z);
+    const fmtH = (h) => (Math.round(h * 4) / 4).toString().replace(/\.0+$/, "");
+    const capturePointer = (el, id) => { try { el.setPointerCapture(id); } catch (e) { /* pointer already gone */ } };
+
+    function dueInfo(task, now) {
+      if (!task.dueDate) return null;
+      const end = new Date(task.dueDate + "T23:59:59").getTime();
+      const days = (end - now) / DAY_MS;
+      if (days < 0)  return { label: "OVERDUE",      cls: "bg-red-100 text-red-600 dark:bg-red-500/25 dark:text-red-200 font-semibold", urgency: 2 };
+      if (days < 1)  return { label: "due today",    cls: "bg-red-50 text-red-500 dark:bg-red-500/15 dark:text-red-300", urgency: 1 };
+      if (days < 2)  return { label: "due tomorrow", cls: "bg-orange-50 text-orange-500 dark:bg-orange-500/15 dark:text-orange-300", urgency: 1 };
+      if (days < 7)  return { label: `due in ${Math.ceil(days)}d`, cls: "bg-amber-50 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300", urgency: 0 };
+      return { label: "due " + task.dueDate.slice(5).replace("-", "/"), cls: "bg-gray-100 text-gray-500 dark:bg-slate-800 dark:text-slate-400", urgency: 0 };
+    }
+
+    // Does the segment (x1,y1)→(x2,y2) pass through rectangle r?
+    // Used by Arrange to keep dependency arrows out of unrelated cards.
+    function segHitsRect(x1, y1, x2, y2, r) {
+      if (Math.max(x1, x2) < r.x || Math.min(x1, x2) > r.x + r.w ||
+          Math.max(y1, y2) < r.y || Math.min(y1, y2) > r.y + r.h) return false;
+      const inside = (x, y) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+      if (inside(x1, y1) || inside(x2, y2)) return true;
+      const cross = (ax, ay, bx, by, cx, cy) => (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+      const segInt = (cx, cy, dx, dy) => {
+        const d1 = cross(cx, cy, dx, dy, x1, y1), d2 = cross(cx, cy, dx, dy, x2, y2);
+        const d3 = cross(x1, y1, x2, y2, cx, cy), d4 = cross(x1, y1, x2, y2, dx, dy);
+        return ((d1 > 0) !== (d2 > 0)) && ((d3 > 0) !== (d4 > 0));
+      };
+      return segInt(r.x, r.y, r.x + r.w, r.y) || segInt(r.x + r.w, r.y, r.x + r.w, r.y + r.h) ||
+             segInt(r.x, r.y + r.h, r.x + r.w, r.y + r.h) || segInt(r.x, r.y, r.x, r.y + r.h);
+    }
+
+    // Turn markdown links [label](url) and bare URLs into clickable anchors.
+    function renderRich(text) {
+      const re = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s]+)/g;
+      const nodes = [];
+      let last = 0, m, k = 0;
+      while ((m = re.exec(text))) {
+        if (m.index > last) nodes.push(text.slice(last, m.index));
+        const href = m[2] || m[3];
+        nodes.push(
+          <a
+            key={k++} href={href} target="_blank" rel="noreferrer"
+            className="text-blue-500 dark:text-blue-400 hover:underline break-all"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {m[1] || m[3]}
+          </a>
+        );
+        last = re.lastIndex;
+      }
+      if (last < text.length) nodes.push(text.slice(last));
+      return nodes;
+    }
+
+    function beep() {
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        [880, 1174].forEach((f, i) => {
+          const o = ctx.createOscillator(), g = ctx.createGain();
+          o.connect(g); g.connect(ctx.destination);
+          o.frequency.value = f;
+          const t = ctx.currentTime + i * 0.25;
+          g.gain.setValueAtTime(0.15, t);
+          g.gain.exponentialRampToValueAtTime(0.001, t + 0.6);
+          o.start(t); o.stop(t + 0.6);
+        });
+      } catch (e) { /* audio not available */ }
+    }
+
+    /* ========================= Persistence ========================== */
+
+    const EMPTY_STATE = { v: 3, tasks: [], links: [], zones: [], history: [], pomodoros: [], timer: null };
+
+    // v3 = current format: 22000×15000 canvas, 1.5×-size content, task.zoneId.
+    // Older saves lived on a 220000×150000 canvas centered at (110000, 75000):
+    // v2 (has zoneId) drew content at 2×, v1 (no zoneId) at 1×. Rescale about
+    // the old center, re-home to the new one, and fill in zone assignments.
+    function migrateState(st) {
+      if (!st || st.v === 3) return st;
+      const oldC = { x: 110000, y: 75000 };
+      const k = st.tasks.some((t) => t.zoneId === undefined) ? 1.5 : 0.75;
+      const sx = (v) => (v - oldC.x) * k + CENTER.x;
+      const sy = (v) => (v - oldC.y) * k + CENTER.y;
+      const zones = st.zones.map((z) => ({
+        ...z,
+        w: z.w * k, h: z.h * k,
+        x: clamp(sx(z.x), 0, CANVAS.width - z.w * k),
+        y: clamp(sy(z.y), 0, CANVAS.height - z.h * k),
+      }));
+      const tasks = st.tasks.map((t) => {
+        const moved = {
+          ...t,
+          x: clamp(sx(t.x), 0, CANVAS.width - 420),
+          y: clamp(sy(t.y), 0, CANVAS.height - 240),
+        };
+        return moved.zoneId === undefined ? { ...moved, zoneId: zoneIdAt(moved, zones) } : moved;
+      });
+      return { ...st, v: 3, zones, tasks };
+    }
+
+    function loadState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) return migrateState({ ...EMPTY_STATE, v: undefined, ...JSON.parse(raw) });
+        const legacy = localStorage.getItem(LEGACY_KEY); // migrate v1 (plain task array)
+        if (legacy) {
+          const tasks = JSON.parse(legacy);
+          if (Array.isArray(tasks)) return migrateState({ ...EMPTY_STATE, v: undefined, tasks });
+        }
+      } catch (e) { /* corrupted storage — start fresh */ }
+      return EMPTY_STATE;
+    }
+
+    /* ========================== Task Card =========================== */
+
+    function TaskCard({ task, canvasRef, zoom, now, blocked, dimmed, linkMode, linkSource, onMove, onDrop, onUpdate, onEdit, onComplete, onDelete, onStartTimer, onPick }) {
+      const p = priOf(task);
+      const cardRef = useRef(null);
+      const grip = useRef({ dx: 0, dy: 0 });
+      const [dragging, setDragging] = useState(false);
+      const [subsOpen, setSubsOpen] = useState(false);
+      const [subText, setSubText] = useState("");
+      const due = dueInfo(task, now);
+
+      const subs = task.subtasks || [];
+      const subsDone = subs.filter((s) => s.done).length;
+
+      // Aging: after 3 days on the map a task slowly fades; after 5 it gets a flag.
+      const ageDays = (now - (task.createdAt || now)) / DAY_MS;
+      const agingOpacity = ageDays > 3 ? Math.max(0.55, 1 - (ageDays - 3) * 0.06) : 1;
+      const stale = ageDays > 5;
+
+      const onPointerDown = (e) => {
+        if (e.button !== 0) return; // right button pans the map, not the card
+        if (linkMode) return; // clicks pick link endpoints instead of dragging
+        if (e.target.closest("button, a, input")) return;
+        e.preventDefault(); // stop text-selection from starting mid-drag
+        const rect = cardRef.current.getBoundingClientRect();
+        grip.current = { dx: e.clientX - rect.left, dy: e.clientY - rect.top };
+        setDragging(true);
+        capturePointer(cardRef.current, e.pointerId);
+      };
+
+      const onPointerMove = (e) => {
+        if (!dragging) return;
+        if (e.buttons === 0) { endDrag(); return; } // mouse released outside — never ghost-drag
+        // Pointer math is in screen px (scaled by zoom) — divide back into
+        // canvas coords. Clamp with offsetWidth/Height (layout size), not the
+        // bounding rect: the rect is inflated by the drag scale effect, which
+        // would keep the card just short of the right/bottom map edges.
+        const canvasRect = canvasRef.current.getBoundingClientRect();
+        onMove(
+          task.id,
+          clamp((e.clientX - canvasRect.left - grip.current.dx) / zoom, 0, CANVAS.width - cardRef.current.offsetWidth),
+          clamp((e.clientY - canvasRect.top - grip.current.dy) / zoom, 0, CANVAS.height - cardRef.current.offsetHeight)
+        );
+      };
+
+      const endDrag = () => {
+        if (!dragging) return;
+        setDragging(false);
+        onDrop(task.id); // settle zone membership where the card landed
+      };
+
+      const addSub = () => {
+        const text = subText.trim();
+        if (!text) return;
+        onUpdate(task.id, (t) => ({ ...t, subtasks: [...(t.subtasks || []), { id: uid(), text, done: false }] }));
+        setSubText("");
+      };
+      const toggleSub = (sid) => onUpdate(task.id, (t) => ({ ...t, subtasks: (t.subtasks || []).map((s) => (s.id === sid ? { ...s, done: !s.done } : s)) }));
+      const deleteSub = (sid) => onUpdate(task.id, (t) => ({ ...t, subtasks: (t.subtasks || []).filter((s) => s.id !== sid) }));
+
+      const urgencyRing =
+        due?.urgency === 2 ? "ring-2 ring-red-300 dark:ring-red-500/70 urgent-glow" :
+        due?.urgency === 1 ? "ring-1 ring-orange-200 dark:ring-orange-400/50" : "";
+      const linkRing = linkSource === task.id ? "ring-2 ring-blue-400" : linkMode ? "hover:ring-2 hover:ring-blue-300 dark:hover:ring-blue-500/60" : "";
+
+      return (
+        <div
+          ref={cardRef}
+          data-task-id={task.id}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+          onClickCapture={(e) => { if (linkMode) { e.stopPropagation(); e.preventDefault(); onPick(task.id); } }}
+          className={`task-card pop-in absolute select-none rounded-3xl bg-white dark:bg-slate-900 p-6 overflow-hidden ${dragging ? "dragging scale-105 shadow-xl dark:shadow-black/50 z-50" : "shadow-sm hover:shadow-lg dark:shadow-black/30 dark:hover:shadow-black/50"} ${urgencyRing} ${linkRing} ${dimmed ? "opacity-[0.15] grayscale pointer-events-none" : ""} ${linkMode && !dimmed ? "cursor-crosshair" : ""}`}
+          style={{ left: task.x, top: task.y, width: p.width, zIndex: dragging ? 50 : 40 - p.rank * 10, touchAction: "none", ...(dimmed || dragging ? {} : { opacity: agingOpacity }) }}
+        >
+          <div className="flex items-center justify-between gap-2 mb-4">
+            <div className="flex items-center gap-2 flex-wrap min-w-0">
+              <span className={`inline-flex items-center gap-2 text-[16px] font-medium px-3.5 py-1 rounded-full ${p.badge}`}>
+                <span className={`w-2.5 h-2.5 rounded-full ${p.dot}`}></span>
+                {p.label}
+              </span>
+              {due && <span className={`text-[15px] px-3 py-0.5 rounded-full ${due.cls}`}>{due.label}</span>}
+              {blocked && <span className="text-[15px] px-3 py-0.5 rounded-full bg-gray-100 text-gray-500 dark:bg-slate-800 dark:text-slate-400" title="Waiting on a linked task">blocked</span>}
+              {stale && <span className="text-[16px]" title={`Sitting on the map for ${Math.floor(ageDays)} days — finish it or let it go!`}>🚩</span>}
+            </div>
+            <div className="flex items-center shrink-0">
+              <button onClick={() => onEdit(task)} title="Edit task" className="text-gray-300 hover:text-blue-500 dark:text-slate-600 dark:hover:text-blue-400 transition-colors text-lg leading-none px-1">✎</button>
+              <button onClick={() => onDelete(task.id)} title="Delete task" className="text-gray-300 hover:text-red-500 dark:text-slate-600 dark:hover:text-red-400 transition-colors text-xl leading-none px-1">✕</button>
+            </div>
+          </div>
+
+          <h3 className="font-semibold text-[22px] leading-snug mb-1.5 break-words text-gray-900 dark:text-slate-100">{task.title}</h3>
+          {task.description && <p className="text-[18px] text-gray-500 dark:text-slate-400 leading-snug mb-3 break-words">{renderRich(task.description)}</p>}
+
+          {(task.estimateH > 0 || task.pomodoros > 0) && (
+            <p className="text-[16px] text-gray-400 dark:text-slate-500 mb-3">
+              {task.estimateH > 0 && <span>≈ {fmtH(task.estimateH)}h</span>}
+              {task.estimateH > 0 && task.pomodoros > 0 && <span> · </span>}
+              {task.pomodoros > 0 && <span>{task.pomodoros} focus session{task.pomodoros !== 1 ? "s" : ""}</span>}
+            </p>
+          )}
+
+          {/* -------- subtasks (hidden behind a toggle) -------- */}
+          <div className="mb-3">
+            <button
+              onClick={() => setSubsOpen((v) => !v)}
+              className="text-[16px] text-gray-400 hover:text-blue-500 dark:text-slate-500 dark:hover:text-blue-300 transition-colors"
+            >
+              {subsOpen ? "▾" : "▸"} Subtasks{subs.length > 0 ? ` ${subsDone}/${subs.length}` : ""}
+            </button>
+            {subsOpen && (
+              <div className="mt-2 space-y-1.5">
+                {subs.map((s) => (
+                  <div key={s.id} className="flex items-center gap-2.5 group">
+                    <input
+                      type="checkbox" checked={s.done} onChange={() => toggleSub(s.id)}
+                      className="w-5 h-5 shrink-0 accent-emerald-500 cursor-pointer"
+                    />
+                    <span className={`text-[16px] flex-1 break-words leading-snug ${s.done ? "line-through text-gray-300 dark:text-slate-600" : "text-gray-600 dark:text-slate-300"}`}>{s.text}</span>
+                    <button onClick={() => deleteSub(s.id)} title="Remove subtask" className="text-gray-200 hover:text-red-500 dark:text-slate-700 dark:hover:text-red-400 text-base leading-none opacity-0 group-hover:opacity-100 transition-opacity">✕</button>
+                  </div>
+                ))}
+                <input
+                  value={subText}
+                  onChange={(e) => setSubText(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addSub(); } }}
+                  placeholder="Add subtask ↵"
+                  className="w-full rounded-xl bg-gray-50 dark:bg-slate-800 px-3 py-1.5 text-[16px] outline-none ring-1 ring-gray-200 dark:ring-slate-700 focus:ring-2 focus:ring-blue-400 placeholder:text-gray-300 dark:placeholder:text-slate-600"
+                />
+              </div>
+            )}
+          </div>
+
+          <div className="flex gap-2">
+            <button
+              onClick={() => onStartTimer(task.id)}
+              title="Start a 25-minute focus session on this task"
+              className="px-4 py-2 text-[17px] rounded-2xl bg-gray-50 text-gray-400 hover:bg-blue-50 hover:text-blue-500 dark:bg-slate-800 dark:text-slate-500 dark:hover:bg-blue-500/15 dark:hover:text-blue-300 transition-colors"
+            >
+              25m
+            </button>
+            <button
+              onClick={() => onComplete(task.id)}
+              className={`flex-1 text-[17px] font-medium py-2 rounded-2xl transition-colors ${p.button}`}
+            >
+              ✓ Complete
+            </button>
+          </div>
+
+          {/* -------- subtask progress: thin line along the bottom edge -------- */}
+          {subs.length > 0 && (
+            <div className="absolute bottom-0 left-0 right-0 h-[5px] bg-gray-100 dark:bg-slate-800">
+              <div
+                className="h-full bg-emerald-400 dark:bg-emerald-500 transition-all duration-300"
+                style={{ width: `${(subsDone / subs.length) * 100}%` }}
+              ></div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ========================= Links (SVG) =========================== */
+
+    function LinksLayer({ links, tasks, hiddenIds, onDeleteLink }) {
+      const byId = useMemo(() => Object.fromEntries(tasks.map((t) => [t.id, t])), [tasks]);
+      return (
+        <svg className="absolute inset-0" width={CANVAS.width} height={CANVAS.height} style={{ zIndex: 5, pointerEvents: "none" }}>
+          <defs>
+            <marker id="arrowhead" markerWidth="15" markerHeight="12" refX="13.5" refY="6" orient="auto">
+              <polygon points="0 0, 15 6, 0 12" fill="#60a5fa" opacity="0.9" />
+            </marker>
+          </defs>
+          {links.map((l) => {
+            const a = byId[l.from], b = byId[l.to];
+            if (!a || !b || a.completed || b.completed || hiddenIds.has(a.id) || hiddenIds.has(b.id)) return null;
+            const c1 = centerOf(a), c2 = centerOf(b);
+            const dx = c2.x - c1.x, dy = c2.y - c1.y, dist = Math.hypot(dx, dy) || 1;
+            const sx = c1.x + (dx / dist) * 90, sy = c1.y + (dy / dist) * 60;
+            const ex = c2.x - (dx / dist) * 158, ey = c2.y - (dy / dist) * 98;
+            const mx = (sx + ex) / 2 - (dy / dist) * 42, my = (sy + ey) / 2 + (dx / dist) * 42;
+            const d = `M ${sx} ${sy} Q ${mx} ${my} ${ex} ${ey}`;
+            return (
+              <g key={l.id} style={{ pointerEvents: "auto", cursor: "pointer" }} onClick={() => onDeleteLink(l.id)}>
+                <title>Dependency: finish the first task before the arrow's target. Click to remove.</title>
+                <path d={d} fill="none" stroke="transparent" strokeWidth="24" />
+                <path d={d} className="link-path" fill="none" stroke="#60a5fa" strokeOpacity="0.7" strokeWidth="3" strokeDasharray="10 8" markerEnd="url(#arrowhead)" />
+              </g>
+            );
+          })}
+        </svg>
+      );
+    }
+
+    /* ============================ Zones ============================== */
+
+    function Zone({ zone, count, priority, zoom, onPatch, onDelete, beginDrag, onDragTo, onDragState }) {
+      const c = ZONE_COLORS[zone.color % ZONE_COLORS.length];
+      const drag = useRef(null);
+      const resize = useRef(null);
+      const [liveDrag, setLiveDrag] = useState(false);
+
+      const endHeaderDrag = () => {
+        drag.current = null;
+        setLiveDrag(false);
+        onDragState(false);
+      };
+      const headerDown = (e) => {
+        if (e.button !== 0) return; // right button pans the map
+        if (e.target.closest("button, input")) return;
+        e.preventDefault(); // no text selection while dragging the zone
+        drag.current = { x0: e.clientX, y0: e.clientY, snap: beginDrag(zone.id) };
+        setLiveDrag(true);
+        onDragState(true);
+        capturePointer(e.currentTarget, e.pointerId);
+      };
+      const headerMove = (e) => {
+        if (!drag.current) return;
+        if (e.buttons === 0) { endHeaderDrag(); return; } // button no longer held — never ghost-drag
+        onDragTo(drag.current.snap, (e.clientX - drag.current.x0) / zoom, (e.clientY - drag.current.y0) / zoom);
+      };
+
+      const endResize = () => {
+        resize.current = null;
+        onDragState(false);
+      };
+      const resizeDown = (e) => {
+        if (e.button !== 0) return; // right button pans the map
+        e.preventDefault();
+        e.stopPropagation();
+        resize.current = { w: zone.w, h: zone.h, x0: e.clientX, y0: e.clientY };
+        onDragState(true);
+        capturePointer(e.currentTarget, e.pointerId);
+      };
+      const resizeMove = (e) => {
+        if (!resize.current) return;
+        if (e.buttons === 0) { endResize(); return; }
+        onPatch(zone.id, {
+          w: clamp(resize.current.w + (e.clientX - resize.current.x0) / zoom, 400, CANVAS.width - zone.x),
+          h: clamp(resize.current.h + (e.clientY - resize.current.y0) / zoom, 260, CANVAS.height - zone.y),
+        });
+      };
+
+      const header = (
+        <div className={`flex items-center gap-2.5 px-4 py-2 select-none rounded-t-3xl border-b ${c.chip}`}>
+          <button
+            onClick={() => onPatch(zone.id, { collapsed: !zone.collapsed })}
+            title={zone.collapsed ? "Expand zone" : "Collapse zone (hides its tasks)"}
+            className={`text-lg ${c.text} hover:opacity-60`}
+          >
+            {zone.collapsed ? "▸" : "▾"}
+          </button>
+          <button
+            onClick={() => onPatch(zone.id, { color: (zone.color + 1) % ZONE_COLORS.length })}
+            title="Change zone color"
+            className={`w-5 h-5 rounded-full shrink-0 ${c.dot} ring-1 ring-black/10 dark:ring-white/20 hover:scale-125 transition-transform`}
+          ></button>
+          <input
+            value={zone.name}
+            onChange={(e) => onPatch(zone.id, { name: e.target.value })}
+            className={`bg-transparent outline-none text-[18px] font-semibold tracking-wide flex-1 min-w-0 ${c.text}`}
+            spellCheck="false"
+          />
+          {priority && (
+            <span className={`inline-flex items-center gap-1.5 text-[15px] font-medium px-3 py-0.5 rounded-full shrink-0 ${PRIORITIES[priority].badge}`} title="Overall priority of the tasks in this zone">
+              <span className={`w-2.5 h-2.5 rounded-full ${PRIORITIES[priority].dot}`}></span>
+              {PRIORITIES[priority].label}
+            </span>
+          )}
+          <span className={`text-[15px] px-2.5 rounded-full border ${c.chip} ${c.text}`}>{count}</span>
+          <button onClick={() => onDelete(zone.id)} title="Delete zone (keeps its tasks)" className="text-gray-300 hover:text-red-500 dark:text-slate-600 dark:hover:text-red-400 text-lg">✕</button>
+        </div>
+      );
+
+      // The whole zone box is a drag surface (header + empty body), so there's
+      // plenty of room to grab it — tasks sit above and still drag themselves.
+      const dragProps = {
+        onPointerDown: headerDown, onPointerMove: headerMove,
+        onPointerUp: endHeaderDrag, onPointerCancel: endHeaderDrag,
+        style: { touchAction: "none" },
+      };
+
+      if (zone.collapsed) {
+        return (
+          <div
+            {...dragProps}
+            className={`zone-box ${liveDrag ? "live-drag" : ""} absolute rounded-3xl bg-white/80 dark:bg-slate-900/80 backdrop-blur-md shadow-md select-none cursor-grab active:cursor-grabbing`}
+            style={{ ...dragProps.style, left: zone.x, top: zone.y, width: 360, zIndex: 8 }}
+          >
+            {header}
+            <p className="px-4 py-2 text-[16px] text-gray-400 dark:text-slate-500">{count} task{count !== 1 ? "s" : ""} hidden</p>
+          </div>
+        );
+      }
+
+      return (
+        <div
+          {...dragProps}
+          className={`zone-box ${liveDrag ? "live-drag" : ""} absolute rounded-3xl border-[3px] border-dashed ${c.border} ${c.bg} select-none cursor-grab active:cursor-grabbing`}
+          style={{ ...dragProps.style, left: zone.x, top: zone.y, width: zone.w, height: zone.h, zIndex: 2 }}
+        >
+          {header}
+          <div
+            onPointerDown={resizeDown} onPointerMove={resizeMove} onPointerUp={endResize} onPointerCancel={endResize}
+            className={`absolute bottom-0 right-0 w-9 h-9 cursor-se-resize rounded-tl-2xl border ${c.chip} opacity-50 hover:opacity-100`}
+            style={{ touchAction: "none" }}
+            title="Drag to resize"
+          ></div>
+        </div>
+      );
+    }
+
+    /* ====================== Task Modal (add/edit) ==================== */
+
+    function TaskModal({ initial, onSave, onClose }) {
+      const [title, setTitle] = useState(initial?.title || "");
+      const [description, setDescription] = useState(initial?.description || "");
+      const [priority, setPriority] = useState(initial?.priority || "medium");
+      const [estimate, setEstimate] = useState(initial?.estimateH > 0 ? String(initial.estimateH) : "");
+      const [dueDate, setDueDate] = useState(initial?.dueDate || "");
+      const titleRef = useRef(null);
+
+      useEffect(() => {
+        titleRef.current?.focus();
+        const onKey = (e) => e.key === "Escape" && onClose();
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, []);
+
+      const submit = (e) => {
+        e.preventDefault();
+        if (!title.trim()) return;
+        onSave({
+          title: title.trim(),
+          description: description.trim(),
+          priority,
+          estimateH: Math.max(0, parseFloat(estimate) || 0),
+          dueDate: dueDate || null,
+        });
+      };
+
+      const inputCls = "w-full rounded-xl bg-gray-50 dark:bg-slate-800 px-3.5 py-2.5 text-sm outline-none ring-1 ring-gray-200 dark:ring-slate-700 focus:ring-2 focus:ring-blue-400 placeholder:text-gray-400 dark:placeholder:text-slate-500 transition-shadow";
+
+      return (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-gray-900/20 dark:bg-black/50 backdrop-blur-sm" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+          <form onSubmit={submit} className="pop-in w-[440px] max-w-[92vw] rounded-3xl bg-white dark:bg-slate-900 p-7 shadow-2xl">
+            <h2 className="text-lg font-semibold mb-5 text-gray-900 dark:text-slate-100">{initial ? "Edit Task" : "New Task"}</h2>
+
+            <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1.5">Title</label>
+            <input ref={titleRef} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="What needs doing?" className={`${inputCls} mb-4`} />
+
+            <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1.5">Description <span className="text-gray-300 dark:text-slate-600">(optional)</span></label>
+            <textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="A few details…" rows="2" className={`${inputCls} mb-4 resize-none`} />
+
+            <div className="grid grid-cols-2 gap-3 mb-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1.5">Time needed <span className="text-gray-300 dark:text-slate-600">(hours)</span></label>
+                <input type="number" min="0" step="0.25" value={estimate} onChange={(e) => setEstimate(e.target.value)} placeholder="e.g. 1.5" className={inputCls} />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1.5">Due date <span className="text-gray-300 dark:text-slate-600">(optional)</span></label>
+                <input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} className={`${inputCls} text-gray-600 dark:text-slate-300`} />
+              </div>
+            </div>
+
+            <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-2">Priority</label>
+            <div className="grid grid-cols-4 gap-1.5 mb-6">
+              {Object.entries(PRIORITIES).map(([key, p]) => (
+                <button
+                  type="button" key={key} onClick={() => setPriority(key)}
+                  className={`flex items-center justify-center gap-1.5 rounded-xl px-2 py-2 text-[12px] font-medium transition-all ${
+                    priority === key ? `${p.badge} ring-2 ring-current/20 shadow-sm` : "bg-gray-50 text-gray-400 hover:bg-gray-100 dark:bg-slate-800 dark:text-slate-500 dark:hover:bg-slate-700"
+                  }`}
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${p.dot}`}></span>
+                  {p.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={onClose} className="px-4 py-2 text-sm rounded-full text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800 transition-colors">Cancel</button>
+              <button type="submit" disabled={!title.trim()} className="px-5 py-2 text-sm font-medium rounded-full bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shadow-sm">{initial ? "Save Changes" : "Add to Map"}</button>
+            </div>
+          </form>
+        </div>
+      );
+    }
+
+    /* ========================== Done Panel =========================== */
+
+    function DonePanel({ tasks, onRestore, onDelete, onClearAll, onClose }) {
+      return (
+        <div className="pop-in fixed right-4 top-16 bottom-4 z-[90] w-80 max-w-[85vw] flex flex-col rounded-3xl bg-white/80 dark:bg-slate-900/85 backdrop-blur-md shadow-xl">
+          <div className="flex items-center justify-between px-5 py-3.5 border-b border-gray-200/60 dark:border-slate-800">
+            <h2 className="font-semibold text-sm text-gray-900 dark:text-slate-100">✓ Done Zone <span className="text-gray-400 dark:text-slate-500 font-normal">({tasks.length})</span></h2>
+            <button onClick={onClose} className="text-gray-300 hover:text-gray-600 dark:text-slate-600 dark:hover:text-slate-300 text-sm px-1">✕</button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-3 space-y-2">
+            {tasks.length === 0 && <p className="text-sm text-gray-400 dark:text-slate-500 text-center mt-8">Nothing completed yet.<br />Get to work!</p>}
+            {tasks.map((t) => {
+              const p = priOf(t);
+              return (
+                <div key={t.id} className="rounded-xl bg-gray-50 dark:bg-slate-800/60 px-3.5 py-2.5">
+                  <div className="flex items-center gap-2">
+                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${p.dot}`}></span>
+                    <span className="text-[13px] line-through text-gray-400 dark:text-slate-500 flex-1 break-words">{t.title}</span>
+                    <button onClick={() => onRestore(t.id)} title="Restore to map" className="text-gray-300 hover:text-blue-500 dark:text-slate-600 dark:hover:text-blue-400 text-sm">↩</button>
+                    <button onClick={() => onDelete(t.id)} title="Delete forever" className="text-gray-300 hover:text-red-500 dark:text-slate-600 dark:hover:text-red-400 text-sm">✕</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {tasks.length > 0 && (
+            <div className="p-3 border-t border-gray-200/60 dark:border-slate-800">
+              <button onClick={onClearAll} className="w-full py-2 text-xs font-medium rounded-full text-gray-400 hover:text-red-500 hover:bg-red-50 dark:text-slate-500 dark:hover:text-red-400 dark:hover:bg-red-500/10 transition-colors">Clear all completed</button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ========================== Stats Panel ========================== */
+
+    function StatsPanel({ data, active, onClose }) {
+      const t0 = new Date(new Date().setHours(0, 0, 0, 0)).getTime();
+      const today = data.history.filter((h) => h.t >= t0).length;
+      const yesterday = data.history.filter((h) => h.t >= t0 - DAY_MS && h.t < t0).length;
+      const delta = today - yesterday;
+      const pomToday = data.pomodoros.filter((t) => t >= t0).length;
+      const totalH = active.reduce((s, t) => s + (t.estimateH || 0), 0);
+      const overdue = active.filter((t) => t.dueDate && new Date(t.dueDate + "T23:59:59").getTime() < Date.now()).length;
+      const days = [...Array(7)].map((_, i) => {
+        const s = t0 - (6 - i) * DAY_MS;
+        return { label: new Date(s).toLocaleDateString(undefined, { weekday: "narrow" }), n: data.history.filter((h) => h.t >= s && h.t < s + DAY_MS).length };
+      });
+      const max = Math.max(1, ...days.map((d) => d.n));
+
+      const Stat = ({ label, value, accent }) => (
+        <div className="rounded-2xl bg-gray-50 dark:bg-slate-800/60 px-4 py-3">
+          <p className="text-[10px] uppercase tracking-wider text-gray-400 dark:text-slate-500">{label}</p>
+          <p className={`text-xl font-bold ${accent || "text-gray-900 dark:text-slate-100"}`}>{value}</p>
+        </div>
+      );
+
+      return (
+        <div className="pop-in fixed left-4 top-16 z-[90] w-80 max-w-[85vw] rounded-3xl bg-white/80 dark:bg-slate-900/85 backdrop-blur-md shadow-xl">
+          <div className="flex items-center justify-between px-5 py-3.5 border-b border-gray-200/60 dark:border-slate-800">
+            <h2 className="font-semibold text-sm text-gray-900 dark:text-slate-100">Daily Stats</h2>
+            <button onClick={onClose} className="text-gray-300 hover:text-gray-600 dark:text-slate-600 dark:hover:text-slate-300 text-sm px-1">✕</button>
+          </div>
+
+          <div className="p-4 space-y-3">
+            <div className="rounded-2xl bg-gray-50 dark:bg-slate-800/60 px-5 py-4">
+              <p className="text-[10px] uppercase tracking-wider text-gray-400 dark:text-slate-500 mb-1">Velocity — completed today</p>
+              <div className="flex items-end gap-3">
+                <span className="text-3xl font-bold text-gray-900 dark:text-slate-100">{today}</span>
+                <span className={`text-sm font-semibold pb-1 ${delta > 0 ? "text-emerald-500 dark:text-emerald-400" : delta < 0 ? "text-red-500 dark:text-red-400" : "text-gray-400 dark:text-slate-500"}`}>
+                  {delta > 0 ? `▲ +${delta}` : delta < 0 ? `▼ ${delta}` : "• even"} vs yesterday ({yesterday})
+                </span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <Stat label="Focus sessions today" value={pomToday} accent="text-rose-500 dark:text-rose-300" />
+              <Stat label="Hours on map" value={totalH > 0 ? fmtH(totalH) + "h" : "—"} accent="text-blue-500 dark:text-blue-300" />
+              <Stat label="Active tasks" value={active.length} />
+              <Stat label="Overdue" value={overdue} accent={overdue > 0 ? "text-red-500 dark:text-red-400" : "text-emerald-500 dark:text-emerald-400"} />
+            </div>
+
+            <div className="rounded-2xl bg-gray-50 dark:bg-slate-800/60 px-5 py-4">
+              <p className="text-[10px] uppercase tracking-wider text-gray-400 dark:text-slate-500 mb-2">Completions — last 7 days</p>
+              <div className="flex items-end gap-1.5 h-16">
+                {days.map((d, i) => (
+                  <div key={i} className="flex-1 flex flex-col items-center gap-1" title={`${d.n} completed`}>
+                    <div className={`w-full rounded-sm ${i === 6 ? "bg-blue-500 dark:bg-blue-400" : "bg-gray-300 dark:bg-slate-600"}`} style={{ height: Math.max(3, (d.n / max) * 48) }}></div>
+                    <span className="text-[9px] text-gray-400 dark:text-slate-500">{d.label}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ======================== Pomodoro Widget ======================== */
+
+    function PomodoroWidget({ timer, taskTitle, now, onPause, onResume, onStop, onRestart }) {
+      if (!timer) return null;
+      const remaining = timer.done ? 0 : Math.max(0, timer.paused ? timer.remaining : timer.endsAt - now);
+      const mm = String(Math.floor(remaining / 60000)).padStart(2, "0");
+      const ss = String(Math.floor((remaining % 60000) / 1000)).padStart(2, "0");
+      const progress = 1 - remaining / POMO_MS;
+
+      return (
+        <div className="pop-in fixed bottom-4 left-4 z-[95] w-64 rounded-3xl bg-white/80 dark:bg-slate-900/85 backdrop-blur-md shadow-xl p-5">
+          {timer.done ? (
+            <div>
+              <p className="text-sm font-semibold text-rose-500 dark:text-rose-300 mb-1">Session complete!</p>
+              <p className="text-[12px] text-gray-500 dark:text-slate-400 mb-3 truncate">Nice focus on “{taskTitle}”.</p>
+              <div className="flex gap-2">
+                <button onClick={onRestart} className="flex-1 py-2 text-[12px] font-medium rounded-full bg-rose-500 text-white hover:bg-rose-600 transition-colors">Go again (25m)</button>
+                <button onClick={onStop} className="px-3.5 py-2 text-[12px] rounded-full text-gray-400 hover:bg-gray-100 dark:text-slate-500 dark:hover:bg-slate-800">✕</button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <p className="text-[10px] uppercase tracking-wider text-gray-400 dark:text-slate-500">Focusing on</p>
+                <button onClick={onStop} title="Stop session" className="text-gray-300 hover:text-red-500 dark:text-slate-600 dark:hover:text-red-400 text-xs">✕</button>
+              </div>
+              <p className="text-[13px] font-medium text-gray-800 dark:text-slate-200 mb-2 truncate">{taskTitle}</p>
+              <div className="flex items-center gap-3">
+                <span className={`text-3xl font-bold tabular-nums ${timer.paused ? "text-gray-300 dark:text-slate-600" : "text-rose-500 dark:text-rose-300"}`}>{mm}:{ss}</span>
+                <button
+                  onClick={timer.paused ? onResume : onPause}
+                  className="ml-auto px-3 py-1.5 text-[11px] font-medium rounded-full bg-gray-50 text-gray-500 hover:bg-rose-50 hover:text-rose-500 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-rose-500/15 dark:hover:text-rose-300 transition-colors"
+                >
+                  {timer.paused ? "Resume" : "Pause"}
+                </button>
+              </div>
+              <div className="mt-2.5 h-1 rounded-full bg-gray-100 dark:bg-slate-800 overflow-hidden">
+                <div className="h-full bg-rose-400 transition-all" style={{ width: `${progress * 100}%` }}></div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ===================== Google Drive sync ========================= */
+
+    // Keeps the board in `spatial_tasks_state.json` inside Drive's hidden
+    // appDataFolder. localStorage is always written first (zero UI lag,
+    // offline safe); Drive gets a debounced background copy. Payload is
+    // { rev, savedAt, state } — rev is a counter, higher rev wins on pull.
+    function useDriveSync(dataRef, adoptRemote) {
+      const [status, setStatus] = useState("off"); // off | connecting | saving | synced | error
+      const [signedIn, setSignedIn] = useState(false);
+      const [lastSync, setLastSync] = useState(null);
+      const [clientId, setClientId] = useState(() => {
+        try { return localStorage.getItem(GOOGLE_CLIENT_KEY) || localStorage.getItem("taskmap.gcal.clientId") || ""; } catch (e) { return ""; }
+      });
+      const token = useRef(null);     // { value, exp }
+      const fileId = useRef(null);
+      const rev = useRef(0);
+      const hydrated = useRef(false); // after the first pull, reconnects push instead
+      const signedInRef = useRef(false);
+      const clientIdRef = useRef(clientId); clientIdRef.current = clientId;
+      const saveTimer = useRef(null);
+      const retryTimer = useRef(null);
+
+      const authed = () => token.current && Date.now() < token.current.exp - 60000;
+
+      async function api(url, opts = {}) {
+        const res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: `Bearer ${token.current.value}` } });
+        if (res.status === 401) { token.current = null; throw new Error("401"); }
+        if (!res.ok) throw new Error("Drive API " + res.status);
+        return res;
+      }
+
+      async function findFile() {
+        if (fileId.current) return fileId.current;
+        const res = await api("https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&fields=files(id,name)&pageSize=100");
+        const files = ((await res.json()).files || []).filter((f) => f.name === DRIVE_FILE);
+        fileId.current = files.length ? files[0].id : null;
+        return fileId.current;
+      }
+
+      async function download() {
+        const id = await findFile();
+        if (!id) return null;
+        return (await api(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`)).json();
+      }
+
+      async function upload(payload) {
+        const body = JSON.stringify(payload);
+        const id = await findFile();
+        if (id) {
+          await api(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, {
+            method: "PATCH", headers: { "Content-Type": "application/json" }, body,
+          });
+        } else {
+          const boundary = "taskmap" + Date.now();
+          const multipart =
+            `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n` +
+            JSON.stringify({ name: DRIVE_FILE, parents: ["appDataFolder"] }) +
+            `\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${body}\r\n--${boundary}--`;
+          const res = await api("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", {
+            method: "POST", headers: { "Content-Type": `multipart/related; boundary=${boundary}` }, body: multipart,
+          });
+          fileId.current = (await res.json()).id;
+        }
+      }
+
+      async function push() {
+        if (!authed()) { attemptSilentReauth(); return; }
+        setStatus("saving");
+        try {
+          const next = rev.current + 1;
+          await upload({ rev: next, savedAt: Date.now(), state: dataRef.current });
+          rev.current = next;
+          setLastSync(Date.now());
+          setStatus("synced");
+        } catch (e) {
+          if (e.message === "401") { attemptSilentReauth(); return; }
+          // changes are already safe in localStorage — retry quietly
+          setStatus("error");
+          clearTimeout(retryTimer.current);
+          retryTimer.current = setTimeout(push, 15000);
+        }
+      }
+
+      async function pull(initial) {
+        const remote = await download();
+        if (remote && remote.state && (initial || (remote.rev || 0) > rev.current)) {
+          rev.current = remote.rev || 0;
+          adoptRemote(remote.state);
+          setLastSync(Date.now());
+          setStatus("synced");
+        } else if (!remote) {
+          await push(); // no file on Drive (first device, or file deleted): seed it
+        } else if (initial) {
+          rev.current = Math.max(rev.current, remote.rev || 0);
+          setLastSync(Date.now());
+          setStatus("synced");
+        } else {
+          // don't paper over an in-progress save or a pending upload retry
+          setStatus((s) => (s === "saving" || s === "error" ? s : "synced"));
+        }
+        hydrated.current = true;
+      }
+
+      function connect(id, silent) {
+        const cid = (id || "").trim();
+        if (!cid) return;
+        if (!(window.google && google.accounts && google.accounts.oauth2)) {
+          if (!silent) setStatus("error");
+          return;
+        }
+        setClientId(cid);
+        try { localStorage.setItem(GOOGLE_CLIENT_KEY, cid); } catch (e) {}
+        setStatus("connecting");
+        try {
+          google.accounts.oauth2.initTokenClient({
+            client_id: cid,
+            scope: DRIVE_SCOPE,
+            callback: async (resp) => {
+              if (resp.error) { setStatus(silent ? "off" : "error"); return; }
+              token.current = { value: resp.access_token, exp: Date.now() + (parseInt(resp.expires_in, 10) || 3600) * 1000 };
+              setSignedIn(true);
+              signedInRef.current = true;
+              try { localStorage.setItem(DRIVE_AUTOCONNECT_KEY, "1"); } catch (e) {}
+              try {
+                if (hydrated.current) await push();
+                else await pull(true);
+              } catch (e) { setStatus("error"); }
+            },
+            error_callback: () => setStatus(silent ? "off" : "error"),
+          }).requestAccessToken(silent ? { prompt: "" } : {});
+        } catch (e) {
+          if (!silent) setStatus("error");
+        }
+      }
+
+      // Access tokens expire after ~1h; renew without bothering the user.
+      function attemptSilentReauth() {
+        let auto = false;
+        try { auto = localStorage.getItem(DRIVE_AUTOCONNECT_KEY) === "1"; } catch (e) {}
+        if (auto && clientIdRef.current) connect(clientIdRef.current, true);
+        else setStatus("off");
+      }
+
+      function disconnect() {
+        try { token.current && google.accounts.oauth2.revoke(token.current.value); } catch (e) {}
+        token.current = null;
+        setSignedIn(false);
+        signedInRef.current = false;
+        setStatus("off");
+        try { localStorage.removeItem(DRIVE_AUTOCONNECT_KEY); } catch (e) {}
+      }
+
+      // Debounced background save — called on every data change from the app.
+      function queueSave() {
+        if (!signedInRef.current) return; // Drive off → localStorage only
+        clearTimeout(saveTimer.current);
+        saveTimer.current = setTimeout(push, 2500);
+      }
+
+      async function forceSync() {
+        if (!authed()) { connect(clientIdRef.current, false); return; }
+        setStatus("saving");
+        try {
+          const remote = await download();
+          if (remote && remote.state && (remote.rev || 0) > rev.current) {
+            rev.current = remote.rev || 0;
+            adoptRemote(remote.state);
+            setLastSync(Date.now());
+            setStatus("synced");
+          } else {
+            await push();
+          }
+        } catch (e) { setStatus("error"); }
+      }
+
+      // Reconnect automatically once the Google script is ready.
+      useEffect(() => {
+        let auto = false;
+        try { auto = localStorage.getItem(DRIVE_AUTOCONNECT_KEY) === "1"; } catch (e) {}
+        if (!auto || !clientIdRef.current) return;
+        setSignedIn(true); // this browser opted into Drive sync
+        signedInRef.current = true;
+        let tries = 0;
+        const iv = setInterval(() => {
+          if (window.google && google.accounts && google.accounts.oauth2) {
+            clearInterval(iv);
+            connect(clientIdRef.current, true);
+          } else if (++tries > 25) {
+            clearInterval(iv);
+            setStatus("error");
+          }
+        }, 250);
+        return () => clearInterval(iv);
+      }, []);
+
+      // Pull other devices' edits every 30s (skipped mid-drag).
+      useEffect(() => {
+        const iv = setInterval(() => {
+          if (!authed()) return;
+          if (document.querySelector(".task-card.dragging") || document.body.style.userSelect === "none") return;
+          pull(false).catch(() => {});
+        }, 30000);
+        return () => clearInterval(iv);
+      }, []);
+
+      return { status, signedIn, lastSync, clientId, connect, disconnect, queueSave, forceSync };
+    }
+
+    function SyncMenu({ drive }) {
+      const [open, setOpen] = useState(false);
+      const [idDraft, setIdDraft] = useState("");
+      useEffect(() => { setIdDraft(drive.clientId); }, [drive.clientId]);
+      useEffect(() => {
+        if (!open) return;
+        const close = (e) => { if (!e.target.closest("[data-sync-menu]")) setOpen(false); };
+        document.addEventListener("pointerdown", close);
+        return () => document.removeEventListener("pointerdown", close);
+      }, [open]);
+
+      const s = drive.status;
+      const tone =
+        s === "synced" ? "text-emerald-500 dark:text-emerald-400" :
+        s === "saving" || s === "connecting" ? "text-blue-500 dark:text-blue-400" :
+        s === "error" ? "text-amber-500 dark:text-amber-400" :
+        "text-gray-300 dark:text-slate-600";
+      const title =
+        s === "synced" ? "Synced to Google Drive" :
+        s === "saving" ? "Saving to Google Drive…" :
+        s === "connecting" ? "Connecting to Google Drive…" :
+        s === "error" ? "Sync problem — changes are saved locally and will retry" :
+        "Google Drive sync is off — click to set up";
+
+      return (
+        <div className="relative" data-sync-menu>
+          <button onClick={() => setOpen((v) => !v)} title={title} className={`flex items-center gap-1 px-1.5 py-1 rounded-full hover:bg-gray-100 dark:hover:bg-slate-800 transition-colors ${tone}`}>
+            <svg viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5">
+              <path d="M6.6 19a4.6 4.6 0 0 1-.9-9.11 6.2 6.2 0 0 1 12.06 1.4A4.1 4.1 0 0 1 17.4 19H6.6z" />
+            </svg>
+            {(s === "saving" || s === "connecting") && <span className="inline-block w-3 h-3 rounded-full border-2 border-current border-t-transparent animate-spin"></span>}
+            {s === "synced" && <span className="text-[12px] font-bold leading-none">✓</span>}
+            {s === "error" && <span className="text-[12px] font-bold leading-none">!</span>}
+            {s === "off" && <span className="text-[12px] font-bold leading-none">—</span>}
+          </button>
+
+          {open && (
+            <div className="pop-in absolute left-0 top-full mt-2 w-80 rounded-2xl bg-white/95 dark:bg-slate-900/95 backdrop-blur-md shadow-xl ring-1 ring-gray-200/60 dark:ring-slate-700/60 p-4 z-[97]">
+              {drive.signedIn ? (
+                <div className="space-y-3">
+                  <div>
+                    <p className="text-[13px] font-semibold text-gray-800 dark:text-slate-200">Google Drive sync</p>
+                    <p className="text-[12px] text-gray-400 dark:text-slate-500">
+                      {drive.lastSync ? "Last synced " + new Date(drive.lastSync).toLocaleTimeString() : "Not synced yet this session"}
+                    </p>
+                  </div>
+                  <button onClick={drive.forceSync} className="w-full py-2 text-[13px] font-medium rounded-full bg-blue-500 text-white hover:bg-blue-600 transition-colors">Force Sync Now</button>
+                  <button onClick={drive.disconnect} className="w-full py-1.5 text-[12px] rounded-full text-gray-400 hover:text-red-500 hover:bg-red-50 dark:text-slate-500 dark:hover:text-red-400 dark:hover:bg-red-500/10 transition-colors">Disconnect</button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-[13px] font-semibold text-gray-800 dark:text-slate-200">Sync with Google Drive</p>
+                  <p className="text-[12px] text-gray-500 dark:text-slate-400 leading-relaxed">
+                    Your map is stored in a hidden app-only folder in your own Drive, so the same board follows you between your desktop and laptop.
+                  </p>
+                  <div className="rounded-xl bg-gray-50 dark:bg-slate-800/60 p-3 text-[11px] text-gray-500 dark:text-slate-400 leading-relaxed space-y-1">
+                    <p>1. In <a className="text-blue-500 hover:underline" href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank" rel="noreferrer">Google Cloud Console</a>, enable the <b>Google Drive API</b>.</p>
+                    <p>2. Credentials → OAuth client ID (Web application) with <code className="bg-white dark:bg-slate-900 px-1 rounded">{window.location.origin}</code> as an authorized JavaScript origin.</p>
+                    <p>3. Paste the Client ID below and connect.</p>
+                  </div>
+                  <input
+                    value={idDraft} onChange={(e) => setIdDraft(e.target.value)}
+                    placeholder="xxxxxxxx.apps.googleusercontent.com" spellCheck="false"
+                    className="w-full rounded-xl bg-gray-50 dark:bg-slate-800 px-3 py-2 text-[12px] outline-none ring-1 ring-gray-200 dark:ring-slate-700 focus:ring-2 focus:ring-blue-400 placeholder:text-gray-400 dark:placeholder:text-slate-500"
+                  />
+                  <button
+                    onClick={() => drive.connect(idDraft, false)} disabled={!idDraft.trim()}
+                    className="w-full py-2 text-[13px] font-medium rounded-full bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40 transition-colors"
+                  >
+                    Connect Google Drive
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* ============================= App =============================== */
+
+    function App() {
+      const [data, setData] = useState(loadState);
+      const [now, setNow] = useState(Date.now());
+      const [modal, setModal] = useState(null); // null | {} (new task) | { task } (edit)
+      const [showDone, setShowDone] = useState(false);
+      const [showStats, setShowStats] = useState(false);
+      const [focusMode, setFocusMode] = useState(false);
+      const [linkStep, setLinkStep] = useState(null); // null | 'from' | taskId (source picked)
+      const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
+      const [zoneDragging, setZoneDragging] = useState(false);
+      const [zoom, setZoom] = useState(ZOOM_INIT);
+      const [panning, setPanning] = useState(false);
+      const canvasRef = useRef(null);
+      const viewportRef = useRef(null);
+      const zoomAnchor = useRef(null); // point to keep fixed on screen across a zoom change
+      const pan = useRef(null); // right-button drag state
+      const panMoved = useRef(false); // suppress the context menu only after a real pan
+
+      /* ---- zoom ---- */
+      // next: (prevZoom) => targetZoom. Anchors at (clientX, clientY), or the
+      // viewport center when no cursor position is given (buttons / keyboard).
+      const applyZoom = useCallback((next, clientX, clientY) => {
+        const vp = viewportRef.current;
+        const vpRect = vp.getBoundingClientRect();
+        // Measure against the canvas rect (not scroll offsets): when zoomed out
+        // the canvas is centered in the viewport, so it doesn't sit at scroll 0.
+        const cRect = canvasRef.current.getBoundingClientRect();
+        const px = clientX == null ? vp.clientWidth / 2 : clientX - vpRect.left;
+        const py = clientY == null ? vp.clientHeight / 2 : clientY - vpRect.top;
+        setZoom((prev) => {
+          const z = clamp(next(prev), ZOOM_MIN, ZOOM_MAX);
+          if (z === prev) return prev;
+          // If a previous anchor is still pending (batched updates), keep it —
+          // the DOM is stale until the layout effect runs.
+          zoomAnchor.current = zoomAnchor.current || { px, py, cx: (vpRect.left + px - cRect.left) / prev, cy: (vpRect.top + py - cRect.top) / prev };
+          return z;
+        });
+      }, []);
+
+      // Re-aim the scroll position after the canvas rescales, before paint,
+      // so the anchored point doesn't visibly jump.
+      useLayoutEffect(() => {
+        const a = zoomAnchor.current;
+        if (!a) return;
+        zoomAnchor.current = null;
+        const vp = viewportRef.current;
+        vp.scrollLeft = a.cx * zoom - a.px;
+        vp.scrollTop = a.cy * zoom - a.py;
+        // If a right-button pan is in progress, rebase it on the new scroll
+        // position — otherwise its stale pre-zoom snapshot yanks the view to
+        // a random spot on the next mouse move.
+        if (pan.current) {
+          pan.current = {
+            x: pan.current.lx ?? pan.current.x, y: pan.current.ly ?? pan.current.y,
+            lx: pan.current.lx, ly: pan.current.ly,
+            sl: vp.scrollLeft, st: vp.scrollTop,
+          };
+        }
+      }, [zoom]);
+
+      useEffect(() => {
+        const vp = viewportRef.current;
+        // Native listener: React registers wheel as passive, so preventDefault
+        // (needed to stop the viewport scrolling / browser page-zoom) wouldn't work.
+        const onWheel = (e) => {
+          e.preventDefault();
+          applyZoom((p) => p * (e.deltaY < 0 ? 1.1 : 1 / 1.1), e.clientX, e.clientY);
+        };
+        vp.addEventListener("wheel", onWheel, { passive: false });
+        return () => vp.removeEventListener("wheel", onWheel);
+      }, [applyZoom]);
+
+      useEffect(() => {
+        const onKey = (e) => {
+          if (!(e.ctrlKey || e.metaKey) || e.target.closest("input, textarea")) return;
+          if (e.key === "=" || e.key === "+") { e.preventDefault(); applyZoom((p) => p * ZOOM_STEP); }
+          else if (e.key === "-") { e.preventDefault(); applyZoom((p) => p / ZOOM_STEP); }
+          else if (e.key === "0") { e.preventDefault(); applyZoom(() => ZOOM_INIT); }
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, [applyZoom]);
+
+      /* ---- pan: hold right-click and drag ---- */
+      const panDown = (e) => {
+        if (e.button !== 2) return;
+        e.preventDefault();
+        const vp = viewportRef.current;
+        pan.current = { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, sl: vp.scrollLeft, st: vp.scrollTop };
+        panMoved.current = false;
+        setPanning(true);
+        capturePointer(e.currentTarget, e.pointerId);
+      };
+      const panMove = (e) => {
+        if (!pan.current) return;
+        pan.current.lx = e.clientX; pan.current.ly = e.clientY; // remembered for mid-pan zoom rebasing
+        const dx = e.clientX - pan.current.x, dy = e.clientY - pan.current.y;
+        if (Math.abs(dx) + Math.abs(dy) > 3) panMoved.current = true;
+        const vp = viewportRef.current;
+        vp.scrollLeft = pan.current.sl - dx;
+        vp.scrollTop = pan.current.st - dy;
+      };
+      const panEnd = () => { pan.current = null; setPanning(false); };
+
+      /* ---- view helpers ---- */
+      // Canvas-space point at the middle of the viewport (accounts for zoom and
+      // for the canvas being centered when it's smaller than the viewport).
+      const viewCenter = () => {
+        const vp = viewportRef.current;
+        const vpRect = vp.getBoundingClientRect();
+        const cRect = canvasRef.current.getBoundingClientRect();
+        return {
+          x: (vpRect.left + vp.clientWidth / 2 - cRect.left) / zoom,
+          y: (vpRect.top + vp.clientHeight / 2 - cRect.top) / zoom,
+        };
+      };
+
+      /* ---- persistence + Drive sync + clock + theme ---- */
+      // localStorage saves instantly on every change (zero UI lag, offline
+      // safe); Google Drive gets a debounced background copy so every device
+      // signed into the same account sees the same map.
+      const dataRef = useRef(data); dataRef.current = data;
+      const applyingRemote = useRef(false);
+      const adoptRemote = useCallback((state) => {
+        applyingRemote.current = true;
+        setData(migrateState(state) || EMPTY_STATE);
+      }, []);
+      const drive = useDriveSync(dataRef, adoptRemote);
+
+      useEffect(() => {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+        if (applyingRemote.current) { applyingRemote.current = false; return; }
+        drive.queueSave();
+      }, [data]);
+      useEffect(() => {
+        document.documentElement.classList.toggle("dark", dark);
+        try { localStorage.setItem(THEME_KEY, dark ? "dark" : "light"); } catch (e) {}
+      }, [dark]);
+      useEffect(() => {
+        // Belt-and-suspenders: no text selection anywhere while a zone is being dragged/resized
+        document.body.style.userSelect = zoneDragging ? "none" : "";
+        return () => { document.body.style.userSelect = ""; };
+      }, [zoneDragging]);
+      useEffect(() => {
+        const iv = setInterval(() => setNow(Date.now()), 1000);
+        return () => clearInterval(iv);
+      }, []);
+      useEffect(() => {
+        const vp = viewportRef.current;
+        vp.scrollLeft = CENTER.x * ZOOM_INIT - vp.clientWidth / 2;
+        vp.scrollTop = CENTER.y * ZOOM_INIT - vp.clientHeight / 2;
+      }, []);
+      useEffect(() => {
+        const onKey = (e) => e.key === "Escape" && setLinkStep(null);
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, []);
+
+      /* ---- pomodoro completion ---- */
+      useEffect(() => {
+        const t = data.timer;
+        if (t && !t.paused && !t.done && now >= t.endsAt) {
+          beep();
+          setData((d) => ({
+            ...d,
+            pomodoros: [...d.pomodoros, Date.now()],
+            tasks: d.tasks.map((x) => (x.id === d.timer.taskId ? { ...x, pomodoros: (x.pomodoros || 0) + 1 } : x)),
+            timer: { ...d.timer, done: true },
+          }));
+        }
+      }, [now]);
+
+      /* ---- gravity: urgent tasks drift toward the hot center ---- */
+      useEffect(() => {
+        const iv = setInterval(() => {
+          setData((d) => {
+            let changed = false;
+            const tasks = d.tasks.map((t) => {
+              if (t.completed || !t.dueDate) return t;
+              const days = (new Date(t.dueDate + "T23:59:59").getTime() - Date.now()) / DAY_MS;
+              const step = days < 0 ? 14 : days < 1 ? 8 : days < 2 ? 4 : 0;
+              if (!step) return t;
+              const c = centerOf(t);
+              const dx = CENTER.x - c.x, dy = CENTER.y - c.y, dist = Math.hypot(dx, dy);
+              if (dist < 420) return t;
+              changed = true;
+              return { ...t, x: t.x + (dx / dist) * step, y: t.y + (dy / dist) * step };
+            });
+            return changed ? { ...d, tasks } : d;
+          });
+        }, 20000);
+        return () => clearInterval(iv);
+      }, []);
+
+      /* ---- derived ---- */
+      const active = useMemo(() => data.tasks.filter((t) => !t.completed), [data.tasks]);
+      const done = useMemo(() => data.tasks.filter((t) => t.completed), [data.tasks]);
+
+      const hiddenIds = useMemo(() => {
+        const collapsed = data.zones.filter((z) => z.collapsed);
+        return new Set(active.filter((t) => collapsed.some((z) => memberOf(t, z))).map((t) => t.id));
+      }, [active, data.zones]);
+
+      const blockedIds = useMemo(() => {
+        const activeIds = new Set(active.map((t) => t.id));
+        return new Set(data.links.filter((l) => activeIds.has(l.from) && activeIds.has(l.to)).map((l) => l.to));
+      }, [active, data.links]);
+
+      const focusIds = useMemo(() => {
+        if (!focusMode) return null;
+        const ids = new Set(active.filter((t) => t.priority === "critical").map((t) => t.id));
+        if (data.timer && !data.timer.done) ids.add(data.timer.taskId);
+        return ids;
+      }, [focusMode, active, data.timer]);
+
+      const totalH = useMemo(() => active.reduce((s, t) => s + (t.estimateH || 0), 0), [active]);
+      const counts = useMemo(() => {
+        const c = { critical: 0, high: 0, medium: 0, low: 0 };
+        active.forEach((t) => c[t.priority] !== undefined && c[t.priority]++);
+        return c;
+      }, [active]);
+
+      const timerTask = data.timer ? data.tasks.find((t) => t.id === data.timer.taskId) : null;
+
+      /* ---- task ops ---- */
+      const addTask = (fields) => {
+        const c = viewCenter();
+        const cx = c.x - 180, cy = c.y - 90;
+        const jitter = () => (Math.random() - 0.5) * 240;
+        setData((d) => {
+          const t = {
+            id: uid(), ...fields,
+            x: clamp(cx + jitter(), 0, CANVAS.width - 420),
+            y: clamp(cy + jitter(), 0, CANVAS.height - 240),
+            completed: false, pomodoros: 0, subtasks: [], createdAt: Date.now(),
+          };
+          t.zoneId = zoneIdAt(t, d.zones);
+          return { ...d, tasks: [...d.tasks, t] };
+        });
+      };
+
+      const moveTask = useCallback((id, x, y) => {
+        setData((d) => ({ ...d, tasks: d.tasks.map((t) => (t.id === id ? { ...t, x, y } : t)) }));
+      }, []);
+
+      // A drag ended: the card keeps the zone it was dropped into (or none).
+      const dropTask = useCallback((id) => {
+        setData((d) => ({
+          ...d,
+          tasks: d.tasks.map((t) => (t.id === id ? { ...t, zoneId: zoneIdAt(t, d.zones) } : t)),
+        }));
+      }, []);
+
+      const updateTask = useCallback((id, fn) => {
+        setData((d) => ({ ...d, tasks: d.tasks.map((t) => (t.id === id ? fn(t) : t)) }));
+      }, []);
+
+      const completeTask = (id) => setData((d) => ({
+        ...d,
+        tasks: d.tasks.map((t) => (t.id === id ? { ...t, completed: true, completedAt: Date.now() } : t)),
+        history: [...d.history, { t: Date.now(), title: d.tasks.find((t) => t.id === id)?.title || "" }].slice(-500),
+        timer: d.timer?.taskId === id ? null : d.timer,
+      }));
+
+      const restoreTask = (id) => setData((d) => ({ ...d, tasks: d.tasks.map((t) => (t.id === id ? { ...t, completed: false } : t)) }));
+      const deleteTask = (id) => setData((d) => ({
+        ...d,
+        tasks: d.tasks.filter((t) => t.id !== id),
+        links: d.links.filter((l) => l.from !== id && l.to !== id),
+        timer: d.timer?.taskId === id ? null : d.timer,
+      }));
+      const clearDone = () => setData((d) => ({ ...d, tasks: d.tasks.filter((t) => !t.completed) }));
+
+      /* ---- links ---- */
+      const pickForLink = (taskId) => {
+        if (linkStep === "from") { setLinkStep(taskId); return; }
+        if (linkStep && linkStep !== "from") {
+          if (taskId !== linkStep && !data.links.some((l) => l.from === linkStep && l.to === taskId)) {
+            setData((d) => ({ ...d, links: [...d.links, { id: uid(), from: linkStep, to: taskId }] }));
+          }
+          setLinkStep(null);
+        }
+      };
+      const deleteLink = (id) => setData((d) => ({ ...d, links: d.links.filter((l) => l.id !== id) }));
+
+      /* ---- zones ---- */
+      const addZone = () => {
+        const c = viewCenter();
+        setData((d) => ({
+          ...d,
+          zones: [...d.zones, {
+            id: uid(), name: "New Zone", collapsed: false,
+            x: clamp(c.x - 375, 0, CANVAS.width - 750),
+            y: clamp(c.y - 260, 0, CANVAS.height - 520),
+            w: 750, h: 520, color: d.zones.length % ZONE_COLORS.length,
+          }],
+        }));
+      };
+      const patchZone = (id, patch) => setData((d) => ({ ...d, zones: d.zones.map((z) => (z.id === id ? { ...z, ...patch } : z)) }));
+      const deleteZone = (id) => setData((d) => ({
+        ...d,
+        zones: d.zones.filter((z) => z.id !== id),
+        tasks: d.tasks.map((t) => (t.zoneId === id ? { ...t, zoneId: null } : t)),
+      }));
+      const beginZoneDrag = (zoneId) => {
+        const z = data.zones.find((z) => z.id === zoneId);
+        return {
+          zoneId, zx: z.x, zy: z.y, zw: z.w, zh: z.h,
+          // Only tasks assigned to THIS zone travel with it — a task placed in
+          // an overlapping zone stays where its owner is.
+          members: data.tasks.filter((t) => !t.completed && memberOf(t, z)).map((t) => ({ id: t.id, x: t.x, y: t.y })),
+        };
+      };
+      const dragZoneTo = (snap, dX, dY) => {
+        setData((d) => ({
+          ...d,
+          zones: d.zones.map((z) => (z.id === snap.zoneId ? { ...z, x: clamp(snap.zx + dX, 0, CANVAS.width - snap.zw), y: clamp(snap.zy + dY, 0, CANVAS.height - snap.zh) } : z)),
+          tasks: d.tasks.map((t) => {
+            const m = snap.members.find((m) => m.id === t.id);
+            return m ? { ...t, x: clamp(m.x + dX, 0, CANVAS.width - 420), y: clamp(m.y + dY, 0, CANVAS.height - 240) } : t;
+          }),
+        }));
+      };
+
+      /* ---- timer ---- */
+      const startTimer = (taskId) => setData((d) => ({ ...d, timer: { taskId, endsAt: Date.now() + POMO_MS, paused: false, done: false } }));
+      const pauseTimer = () => setData((d) => ({ ...d, timer: { ...d.timer, paused: true, remaining: Math.max(0, d.timer.endsAt - Date.now()) } }));
+      const resumeTimer = () => setData((d) => ({ ...d, timer: { ...d.timer, paused: false, endsAt: Date.now() + d.timer.remaining } }));
+      const stopTimer = () => setData((d) => ({ ...d, timer: null }));
+
+      /* ---- auto arrange ----
+             Scattered, hand-placed feel — nothing lines up on a grid:
+             1. Each zone packs its cards loosely (wide gaps, jittered),
+                growing so nothing bleeds over its edges.
+             2. Chains of linked loose tasks are laid out left→right by
+                dependency depth, so arrows flow forward instead of tangling.
+             3. Zones AND chains drop onto a spiral around the hot center at
+                random angles — first collision-free spot wins, so placement
+                looks random while clearance stays guaranteed. Higher-priority
+                blocks go first and land closer in.
+             4. Remaining loose tasks scatter into the space beyond, sampled
+                at random until they find a spot with generous personal space
+                (closer in for critical, further out for low priority).
+             5. A repair pass nudges cards out of every link's corridor so no
+                arrow cuts through an unrelated card. ---- */
+      const autoArrange = () => {
+        // Real rendered card heights — cards vary with content.
+        const cardH = {};
+        canvasRef.current.querySelectorAll("[data-task-id]").forEach((el) => { cardH[el.dataset.taskId] = el.offsetHeight; });
+        const rnd = (a) => (Math.random() * 2 - 1) * a;
+
+        setData((d) => {
+          const GAP = 240;      // guaranteed clearance between zone/chain blocks
+          const PAD = 50;       // zone edge -> card clearance
+          const HEADER = 70;    // room for the zone header strip
+          const CARD_GAP = 55;
+          const activeT = d.tasks.filter((t) => !t.completed);
+          const activeIds = new Set(activeT.map((t) => t.id));
+          const links = d.links.filter((l) => activeIds.has(l.from) && activeIds.has(l.to));
+          const byId = Object.fromEntries(activeT.map((t) => [t.id, t]));
+          const hOf = (t) => cardH[t.id] || 220;
+          const target = {}, zonePatch = {};
+
+          // --- 1. zone blocks: inner grid with jitter, zone grows to fit ---
+          const zoneBlocks = d.zones.map((z) => {
+            const m = activeT.filter((t) => memberOf(t, z));
+            // linked members sort by dependency depth so prerequisite sits
+            // right before dependent — short arrows that skim no one
+            const mIds = new Set(m.map((t) => t.id));
+            const zl = links.filter((l) => mIds.has(l.from) && mIds.has(l.to));
+            const dep = {};
+            m.forEach((t) => (dep[t.id] = 0));
+            for (let i = 0; i < m.length; i++) {
+              let ch = false;
+              zl.forEach((l) => { if (dep[l.to] < dep[l.from] + 1) { dep[l.to] = dep[l.from] + 1; ch = true; } });
+              if (!ch) break;
+            }
+            m.sort((a, b) => dep[a.id] - dep[b.id] || priOf(a).rank - priOf(b).rank || a.createdAt - b.createdAt);
+            const avg = m.length ? m.reduce((s, t) => s + priOf(t).rank, 0) / m.length : 3.5;
+            if (z.collapsed) return { kind: "zone", z, m, avg, w: 360, h: 110, collapsed: true };
+            const w = Math.max(z.w, Math.max(0, ...m.map((t) => priOf(t).width)) + PAD * 2);
+            let cx = PAD, cy = HEADER, rowH = 0, bottom = HEADER;
+            const rel = m.map((t) => {
+              const cw = priOf(t).width, ch = hOf(t);
+              if (cx > PAD && cx + cw > w - PAD) { cx = PAD; cy += rowH + CARD_GAP; rowH = 0; }
+              const r = { id: t.id, dx: cx + rnd(18), dy: cy + rnd(18) };
+              bottom = Math.max(bottom, r.dy + ch);
+              cx += cw + CARD_GAP;
+              rowH = Math.max(rowH, ch);
+              return r;
+            });
+            const h = m.length ? Math.max(z.h, bottom + PAD) : z.h;
+            return { kind: "zone", z, m, avg, w, h, rel };
+          });
+
+          // --- 2. linked loose tasks → left-to-right dependency chains ---
+          const inZone = new Set(zoneBlocks.flatMap((b) => b.m.map((t) => t.id)));
+          const loose = activeT.filter((t) => !inZone.has(t.id));
+          const looseIds = new Set(loose.map((t) => t.id));
+          const looseLinks = links.filter((l) => looseIds.has(l.from) && looseIds.has(l.to));
+          const compOf = {};
+          loose.forEach((t) => (compOf[t.id] = t.id));
+          const find = (x) => (compOf[x] === x ? x : (compOf[x] = find(compOf[x])));
+          looseLinks.forEach((l) => { compOf[find(l.from)] = find(l.to); });
+          const comps = {};
+          loose.forEach((t) => { const r = find(t.id); (comps[r] = comps[r] || []).push(t); });
+
+          const chainBlocks = [], singles = [];
+          Object.values(comps).forEach((m) => {
+            if (m.length < 2) { singles.push(m[0]); return; }
+            // dependency depth = longest prerequisite path (capped, so a
+            // cyclic link chain can't loop forever)
+            const inComp = new Set(m.map((t) => t.id));
+            const cl = looseLinks.filter((l) => inComp.has(l.from) && inComp.has(l.to));
+            const depth = {};
+            m.forEach((t) => (depth[t.id] = 0));
+            for (let i = 0; i < m.length; i++) {
+              let changed = false;
+              cl.forEach((l) => { if (depth[l.to] < depth[l.from] + 1) { depth[l.to] = depth[l.from] + 1; changed = true; } });
+              if (!changed) break;
+            }
+            const levels = [...new Set(m.map((t) => depth[t.id]))].sort((a, b) => a - b);
+            const cols = levels.map((lv) => m.filter((t) => depth[t.id] === lv));
+            // order each column by where its prerequisites sit → fewer crossings
+            cols.forEach((col, ci) => {
+              if (!ci) { col.sort((a, b) => priOf(a).rank - priOf(b).rank); return; }
+              const prev = {};
+              cols[ci - 1].forEach((t, i) => (prev[t.id] = i));
+              const bary = (t) => {
+                const ps = cl.filter((l) => l.to === t.id).map((l) => prev[l.from]).filter((v) => v !== undefined);
+                return ps.length ? ps.reduce((s, v) => s + v, 0) / ps.length : 99;
+              };
+              col.sort((a, b) => bary(a) - bary(b));
+            });
+            const COL_GAP = 300, ROW_GAP = 130;
+            const colW = cols.map((col) => Math.max(...col.map((t) => priOf(t).width)));
+            const colH = cols.map((col) => col.reduce((s, t) => s + hOf(t), 0) + ROW_GAP * (col.length - 1));
+            const blockH = Math.max(...colH);
+            let x = 0;
+            const rel = [];
+            cols.forEach((col, ci) => {
+              let y = (blockH - colH[ci]) / 2;
+              col.forEach((t) => {
+                rel.push({ id: t.id, dx: x + rnd(35), dy: y + rnd(35) });
+                y += hOf(t) + ROW_GAP;
+              });
+              x += colW[ci] + COL_GAP;
+            });
+            const avg = m.reduce((s, t) => s + priOf(t).rank, 0) / m.length;
+            chainBlocks.push({ kind: "chain", m, avg, w: x - COL_GAP, h: blockH, rel });
+          });
+
+          // --- 3. drop blocks onto a randomized spiral around the center ---
+          // Critical-heavy blocks place first, so they claim the inner spots.
+          // Each candidate ring is probed starting from a random angle; the
+          // first spot with GAP clearance from everything already placed
+          // wins. Random angles → nothing shares an edge line, ever.
+          const blocks = [...zoneBlocks, ...chainBlocks].sort((a, b) => a.avg - b.avg);
+          const placed = []; // {x, y, w, h} of settled blocks
+          const blockCollides = (x, y, w, h) =>
+            placed.some((p) => x < p.x + p.w + GAP && p.x < x + w + GAP && y < p.y + p.h + GAP && p.y < y + h + GAP);
+          blocks.forEach((b, bi) => {
+            let bx = CENTER.x - b.w / 2 + rnd(140), by = CENTER.y - b.h / 2 + rnd(120);
+            if (bi > 0 || blockCollides(bx, by, b.w, b.h)) {
+              search: for (let r = 200; r < 9000; r += 110) {
+                const a0 = Math.random() * 2 * Math.PI;
+                const steps = Math.max(9, Math.floor(r / 70));
+                for (let s = 0; s < steps; s++) {
+                  const a = a0 + (2 * Math.PI * s) / steps;
+                  // mild vertical squash: screens are wider than tall
+                  const x = CENTER.x + r * Math.cos(a) - b.w / 2 + rnd(45);
+                  const y = CENTER.y + r * Math.sin(a) * 0.85 - b.h / 2 + rnd(45);
+                  if (!blockCollides(x, y, b.w, b.h)) { bx = x; by = y; break search; }
+                }
+              }
+            }
+            bx = clamp(bx, 0, CANVAS.width - b.w);
+            by = clamp(by, 0, CANVAS.height - b.h);
+            placed.push({ x: bx, y: by, w: b.w, h: b.h });
+            if (b.kind === "zone") {
+              zonePatch[b.z.id] = b.collapsed ? { x: bx, y: by } : { x: bx, y: by, w: b.w, h: b.h };
+              if (b.rel) {
+                b.rel.forEach((rp) => { target[rp.id] = { x: clamp(bx + rp.dx, 0, CANVAS.width - 420), y: clamp(by + rp.dy, 0, CANVAS.height - 240) }; });
+              } else {
+                // collapsed zone: members stay hidden — shift them with the box
+                b.m.forEach((t) => { target[t.id] = { x: clamp(t.x + bx - b.z.x, 0, CANVAS.width - 420), y: clamp(t.y + by - b.z.y, 0, CANVAS.height - 240) }; });
+              }
+            } else {
+              b.rel.forEach((rp) => { target[rp.id] = { x: clamp(bx + rp.dx, 0, CANVAS.width - 420), y: clamp(by + rp.dy, 0, CANVAS.height - 240) }; });
+            }
+          });
+
+          // --- 4. singles scatter into the space beyond the blocks ---
+          // Rejection sampling in a rank-dependent annulus: random spots are
+          // tried until one has ≥150px of personal space from every block
+          // and every already-placed single. Random, but never crowded.
+          const blockR = placed.length
+            ? Math.max(...placed.flatMap((p) => [
+                Math.hypot(p.x - CENTER.x, p.y - CENTER.y),
+                Math.hypot(p.x + p.w - CENTER.x, p.y - CENTER.y),
+                Math.hypot(p.x - CENTER.x, p.y + p.h - CENTER.y),
+                Math.hypot(p.x + p.w - CENTER.x, p.y + p.h - CENTER.y),
+              ]))
+            : 0;
+          const solids = placed.map((p) => ({ ...p }));
+          const SPACE = 150; // personal space around every loose card
+          singles.sort((a, b) => priOf(a).rank - priOf(b).rank || a.createdAt - b.createdAt);
+          singles.forEach((t) => {
+            const w = priOf(t).width, h = hOf(t);
+            let base = (blockR ? blockR + 150 : 100) + priOf(t).rank * 330;
+            let pos = null;
+            for (let round = 0; round < 6 && !pos; round++, base += 380) {
+              for (let att = 0; att < 70; att++) {
+                const rr = base + Math.random() * 450;
+                const aa = Math.random() * 2 * Math.PI;
+                const x = clamp(CENTER.x + rr * Math.cos(aa) - w / 2, 0, CANVAS.width - 420);
+                const y = clamp(CENTER.y + rr * Math.sin(aa) * 0.8 - h / 2, 0, CANVAS.height - 240);
+                if (!solids.some((p) => x < p.x + p.w + SPACE && p.x < x + w + SPACE && y < p.y + p.h + SPACE && p.y < y + h + SPACE)) {
+                  pos = { x, y };
+                  break;
+                }
+              }
+            }
+            if (!pos) { // pathological board: just land somewhere reasonable
+              pos = {
+                x: clamp(CENTER.x + rnd(3200) - w / 2, 0, CANVAS.width - 420),
+                y: clamp(CENTER.y + rnd(2600) - h / 2, 0, CANVAS.height - 240),
+              };
+            }
+            target[t.id] = pos;
+            solids.push({ x: pos.x, y: pos.y, w, h });
+          });
+
+          // --- 5. hard guarantee: no arrow may cross an unrelated card ---
+          // Every violation is fixed by RELOCATING the obstructing card to a
+          // freshly sampled spot that is provably clear: spaced from every
+          // card, outside every corridor, and with its own links' corridors
+          // (from the new spot) crossing no one. A successful relocation can
+          // therefore never create a new violation, so each round strictly
+          // shrinks the violation set until it reaches zero.
+          const hiddenIn = new Set(zoneBlocks.filter((b) => b.collapsed).flatMap((b) => b.m.map((t) => t.id)));
+          const visible = activeT.filter((t) => !hiddenIn.has(t.id));
+          const visLinks = links.filter((l) => !hiddenIn.has(l.from) && !hiddenIn.has(l.to));
+          const posOf = (id) => target[id] || { x: byId[id].x, y: byId[id].y };
+          const rectOf = (id) => { const p = posOf(id); return { x: p.x, y: p.y, w: priOf(byId[id]).width, h: hOf(byId[id]) }; };
+          const midOf = (id) => { const r = rectOf(id); return { x: r.x + r.w / 2, y: r.y + r.h / 2 }; };
+          const zoneRectOf = (z) => {
+            const p = zonePatch[z.id] || z;
+            return {
+              x: p.x, y: p.y,
+              w: p.w !== undefined ? p.w : (z.collapsed ? 360 : z.w),
+              h: p.h !== undefined ? p.h : (z.collapsed ? 110 : z.h),
+            };
+          };
+          const PADC = 55; // corridor padding — covers the curve bow generously
+          const segHitsPadded = (ax, ay, bx, by, r) =>
+            segHitsRect(ax, ay, bx, by, { x: r.x - PADC, y: r.y - PADC, w: r.w + PADC * 2, h: r.h + PADC * 2 });
+          const corridorHits = (l, rect) => {
+            const a = midOf(l.from), b = midOf(l.to);
+            return segHitsPadded(a.x, a.y, b.x, b.y, rect);
+          };
+          const violations = () => {
+            const bad = new Set();
+            visLinks.forEach((l) => {
+              visible.forEach((t) => {
+                if (t.id === l.from || t.id === l.to) return;
+                if (corridorHits(l, rectOf(t.id))) bad.add(t.id);
+              });
+            });
+            return [...bad];
+          };
+          const okSpot = (id, x, y, insideZone) => {
+            const w = priOf(byId[id]).width, h = hOf(byId[id]);
+            // spaced from every visible card
+            for (const t of visible) {
+              if (t.id === id) continue;
+              const r = rectOf(t.id);
+              if (x < r.x + r.w + 40 && r.x < x + w + 40 && y < r.y + r.h + 40 && r.y < y + h + 40) return false;
+            }
+            // loose cards also stay off zone boxes
+            if (!insideZone) {
+              for (const z of d.zones) {
+                const r = zoneRectOf(z);
+                if (x < r.x + r.w + 60 && r.x < x + w + 60 && y < r.y + r.h + 60 && r.y < y + h + 60) return false;
+              }
+            }
+            // no existing corridor may cross the candidate spot
+            const cand = { x, y, w, h };
+            for (const l of visLinks) {
+              if (l.from === id || l.to === id) continue;
+              if (corridorHits(l, cand)) return false;
+            }
+            // ...and the card's own corridors, from here, must cross no one
+            for (const l of visLinks) {
+              if (l.from !== id && l.to !== id) continue;
+              const o = midOf(l.from === id ? l.to : l.from);
+              for (const t of visible) {
+                if (t.id === id || t.id === l.from || t.id === l.to) continue;
+                if (segHitsPadded(x + w / 2, y + h / 2, o.x, o.y, rectOf(t.id))) return false;
+              }
+            }
+            return true;
+          };
+          const relocate = (id) => {
+            const t = byId[id];
+            const w = priOf(t).width, h = hOf(t);
+            const home = t.zoneId ? d.zones.find((z) => z.id === t.zoneId) : null;
+            if (home && !home.collapsed) {
+              // try to stay inside the home zone, stretching it a bit if cramped
+              // (growth stays under the block gap, so zones still can't touch)
+              for (let grow = 0; grow < 3; grow++) {
+                const zr = zoneRectOf(home);
+                for (let att = 0; att < 90; att++) {
+                  const x = zr.x + PAD + Math.random() * Math.max(1, zr.w - w - PAD * 2);
+                  const y = zr.y + HEADER + Math.random() * Math.max(1, zr.h - h - HEADER - PAD);
+                  if (okSpot(id, x, y, true)) { target[id] = { x, y }; return; }
+                }
+                if (grow < 2) {
+                  const zr2 = zoneRectOf(home);
+                  zonePatch[home.id] = { x: zr2.x, y: zr2.y, w: zr2.w, h: zr2.h + 100 };
+                }
+              }
+            }
+            // open space: widening rings of random spots — the canvas is huge
+            // and corridors are finite, so a clear spot always exists
+            for (let base = 300; base < 12000; base += 450) {
+              for (let att = 0; att < 60; att++) {
+                const rr = base + Math.random() * 450, aa = Math.random() * 2 * Math.PI;
+                const x = clamp(CENTER.x + rr * Math.cos(aa) - w / 2, 0, CANVAS.width - 420);
+                const y = clamp(CENTER.y + rr * Math.sin(aa) * 0.85 - h / 2, 0, CANVAS.height - 240);
+                if (okSpot(id, x, y, false)) { target[id] = { x, y }; return; }
+              }
+            }
+          };
+          for (let round = 0; round < 20; round++) {
+            const bad = violations();
+            if (!bad.length) break;
+            bad.forEach(relocate);
+          }
+
+          return {
+            ...d,
+            zones: d.zones.map((z) => (zonePatch[z.id] ? { ...z, ...zonePatch[z.id] } : z)),
+            tasks: d.tasks.map((t) => (target[t.id] ? { ...t, ...target[t.id] } : t)),
+          };
+        });
+        const vp = viewportRef.current;
+        vp.scrollTo({ left: CENTER.x * zoom - vp.clientWidth / 2, top: CENTER.y * zoom - vp.clientHeight / 2, behavior: "smooth" });
+      };
+
+      /* ---- render ---- */
+      const HeaderBtn = ({ onClick, active: isActive, disabled, children, title }) => (
+        <button
+          onClick={onClick} disabled={disabled} title={title}
+          className={`px-3 py-1.5 text-[13px] font-medium rounded-full transition-colors disabled:opacity-40 ${
+            isActive ? "bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-300" : "text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800"
+          }`}
+        >
+          {children}
+        </button>
+      );
+
+      return (
+        <div className="h-screen flex flex-col">
+          {/* ---------- Header (glass) ---------- */}
+          <header className="z-[96] flex items-center gap-1.5 px-4 py-2.5 border-b border-gray-200/70 dark:border-slate-800 bg-white/70 dark:bg-slate-950/70 backdrop-blur-md flex-wrap">
+            <h1 className="font-bold text-[15px] tracking-tight mr-1 text-gray-900 dark:text-slate-100">entropy</h1>
+            <SyncMenu drive={drive} />
+
+            <div className="hidden md:flex items-center gap-1.5 text-[11px]">
+              {Object.entries(PRIORITIES).map(([key, p]) => (
+                <span key={key} className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full font-medium ${p.badge}`}>
+                  <span className={`w-1.5 h-1.5 rounded-full ${p.dot}`}></span>
+                  {counts[key]}
+                </span>
+              ))}
+              {totalH > 0 && (
+                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-gray-100 text-gray-500 dark:bg-slate-800 dark:text-slate-400 font-medium" title="Total estimated work on the map">
+                  {fmtH(totalH)}h
+                </span>
+              )}
+            </div>
+
+            <div className="flex-1"></div>
+
+            <HeaderBtn onClick={() => setLinkStep(linkStep ? null : "from")} active={!!linkStep} disabled={active.length < 2} title="Link two tasks as a dependency">Link</HeaderBtn>
+            <HeaderBtn onClick={addZone} title="Add a grouping zone to the map">Zone</HeaderBtn>
+            <HeaderBtn onClick={() => setFocusMode((v) => !v)} active={focusMode} title="Dim everything except critical tasks and the active focus session">Focus</HeaderBtn>
+            <HeaderBtn onClick={autoArrange} disabled={active.length === 0} title="Arrange by priority: critical at the center, lower priority further out (zones move by the average priority of their tasks)">Arrange</HeaderBtn>
+            <HeaderBtn onClick={() => { setShowStats((v) => !v); }} active={showStats} title="Daily velocity and workload stats">Stats</HeaderBtn>
+            <HeaderBtn onClick={() => setShowDone((v) => !v)} active={showDone} title="Completed tasks">✓ {done.length}</HeaderBtn>
+            <HeaderBtn onClick={() => setDark((v) => !v)} title={dark ? "Switch to light mode" : "Switch to dark mode"}>{dark ? "☀️" : "🌙"}</HeaderBtn>
+            <button onClick={() => setModal({})} className="ml-1 px-4 py-1.5 text-[13px] font-semibold rounded-full bg-blue-500 text-white hover:bg-blue-600 transition-colors shadow-sm">+ New Task</button>
+          </header>
+
+          {/* ---------- Link-mode banner ---------- */}
+          {linkStep && (
+            <div className="z-[96] flex items-center justify-center gap-3 px-4 py-1.5 bg-blue-50/90 dark:bg-blue-950/80 backdrop-blur border-b border-blue-100 dark:border-blue-900 text-[12px] text-blue-600 dark:text-blue-300">
+              {linkStep === "from"
+                ? <span>Click the task that must be finished <b>first</b>…</span>
+                : <span>Now click the task that <b>depends on it</b> (the arrow will point to it)</span>}
+              <button onClick={() => setLinkStep(null)} className="px-2.5 py-0.5 rounded-full bg-white/70 hover:bg-white dark:bg-slate-800/70 dark:hover:bg-slate-800 transition-colors">Cancel (Esc)</button>
+            </div>
+          )}
+
+          {/* ---------- Map ---------- */}
+          <div
+            ref={viewportRef}
+            className={`map-viewport flex-1 overflow-auto flex ${panning ? "cursor-grabbing" : ""}`}
+            onPointerDown={panDown} onPointerMove={panMove} onPointerUp={panEnd} onPointerCancel={panEnd}
+            onContextMenu={(e) => { if (panMoved.current) { e.preventDefault(); panMoved.current = false; } }}
+          >
+            {/* Sizer div gives the viewport the scaled scroll extents; auto
+                margins center the map when it's smaller than the viewport. */}
+            <div style={{ width: CANVAS.width * zoom, height: CANVAS.height * zoom, overflow: "hidden", margin: "auto", flexShrink: 0 }}>
+            <div ref={canvasRef} className={`map-grid relative ${zoneDragging ? "zone-dragging" : ""}`} style={{ width: CANVAS.width, height: CANVAS.height, transform: `scale(${zoom})`, transformOrigin: "0 0" }}>
+              {data.zones.map((z) => {
+                const members = active.filter((t) => memberOf(t, z));
+                const avg = members.length ? members.reduce((s, t) => s + priOf(t).rank, 0) / members.length : null;
+                return (
+                <Zone
+                  key={z.id} zone={z} zoom={zoom}
+                  count={members.length}
+                  priority={avg === null ? null : ["critical", "high", "medium", "low"][clamp(Math.round(avg), 0, 3)]}
+                  onPatch={patchZone} onDelete={deleteZone}
+                  beginDrag={beginZoneDrag} onDragTo={dragZoneTo}
+                  onDragState={setZoneDragging}
+                />
+                );
+              })}
+
+              <LinksLayer links={data.links} tasks={data.tasks} hiddenIds={hiddenIds} onDeleteLink={deleteLink} />
+
+              {active.length === 0 && (
+                <div className="absolute text-center select-none pointer-events-none" style={{ left: CANVAS.width / 2, top: CANVAS.height / 2 - 60, transform: "translate(-50%, -50%)" }}>
+                  <p className="text-2xl text-gray-400 dark:text-slate-500">Your map is empty.</p>
+                  <p className="text-xl mt-2 text-gray-400 dark:text-slate-500">Hit <span className="text-blue-500 dark:text-blue-400 font-medium">+ New Task</span> to drop your first task on the map.</p>
+                </div>
+              )}
+
+              {active.filter((t) => !hiddenIds.has(t.id)).map((task) => (
+                <TaskCard
+                  key={task.id} task={task} canvasRef={canvasRef} zoom={zoom} now={now}
+                  blocked={blockedIds.has(task.id)}
+                  dimmed={focusIds ? !focusIds.has(task.id) : false}
+                  linkMode={!!linkStep} linkSource={linkStep !== "from" ? linkStep : null}
+                  onMove={moveTask} onDrop={dropTask} onUpdate={updateTask}
+                  onEdit={(t) => setModal({ task: t })}
+                  onComplete={completeTask} onDelete={deleteTask}
+                  onStartTimer={startTimer} onPick={pickForLink}
+                />
+              ))}
+            </div>
+            </div>
+          </div>
+
+          {/* ---------- Zoom controls ---------- */}
+          <div className="fixed bottom-4 right-4 z-[95] flex items-center gap-0.5 rounded-full bg-white/80 dark:bg-slate-900/85 backdrop-blur-md shadow-lg px-1.5 py-1 select-none">
+            <button
+              onClick={() => applyZoom((p) => p / ZOOM_STEP)} disabled={zoom <= ZOOM_MIN + 0.0001}
+              title="Zoom out (scroll down, or Ctrl −)"
+              className="w-7 h-7 rounded-full text-[15px] leading-none text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800 disabled:opacity-30 transition-colors"
+            >−</button>
+            <button
+              onClick={() => applyZoom(() => ZOOM_INIT)}
+              title="Reset zoom to 70% (Ctrl 0)"
+              className="min-w-[44px] px-1 py-1 text-[11px] font-medium tabular-nums rounded-full text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800 transition-colors"
+            >{Math.round(zoom * 100)}%</button>
+            <button
+              onClick={() => applyZoom((p) => p * ZOOM_STEP)} disabled={zoom >= ZOOM_MAX}
+              title="Zoom in (scroll up, or Ctrl +)"
+              className="w-7 h-7 rounded-full text-[15px] leading-none text-gray-500 hover:bg-gray-100 dark:text-slate-400 dark:hover:bg-slate-800 disabled:opacity-30 transition-colors"
+            >+</button>
+          </div>
+
+          {/* ---------- Overlays ---------- */}
+          {modal && (
+            <TaskModal
+              initial={modal.task || null}
+              onSave={(fields) => {
+                if (modal.task) updateTask(modal.task.id, (t) => ({ ...t, ...fields }));
+                else addTask(fields);
+                setModal(null);
+              }}
+              onClose={() => setModal(null)}
+            />
+          )}
+          {showDone && <DonePanel tasks={done} onRestore={restoreTask} onDelete={deleteTask} onClearAll={clearDone} onClose={() => setShowDone(false)} />}
+          {showStats && <StatsPanel data={data} active={active} onClose={() => setShowStats(false)} />}
+          <PomodoroWidget
+            timer={data.timer} taskTitle={timerTask?.title || "(task removed)"} now={now}
+            onPause={pauseTimer} onResume={resumeTimer} onStop={stopTimer}
+            onRestart={() => timerTask && startTimer(timerTask.id)}
+          />
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

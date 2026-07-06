@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(node --version)",
+      "PowerShell(npm --version)",
+      "Bash(command -v node npm)",
+      "Read(//c/Program Files/**)",
+      "Bash(command -v python python3 py)"
+    ]
+  }
+}
