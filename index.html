@@ -1355,9 +1355,20 @@
         return () => clearInterval(iv);
       }, []);
       useEffect(() => {
+        // Center on the hot zone once the viewport actually has a size — some
+        // embedders lay the page out hidden (zero-sized) first, where a scroll
+        // assignment silently clamps to 0.
         const vp = viewportRef.current;
-        vp.scrollLeft = CENTER.x * ZOOM_INIT - vp.clientWidth / 2;
-        vp.scrollTop = CENTER.y * ZOOM_INIT - vp.clientHeight / 2;
+        const center = () => {
+          if (!vp.clientWidth || vp.scrollWidth <= vp.clientWidth) return false;
+          vp.scrollLeft = CENTER.x * ZOOM_INIT - vp.clientWidth / 2;
+          vp.scrollTop = CENTER.y * ZOOM_INIT - vp.clientHeight / 2;
+          return true;
+        };
+        if (center()) return;
+        let tries = 0;
+        const iv = setInterval(() => { if (center() || ++tries > 60) clearInterval(iv); }, 50);
+        return () => clearInterval(iv);
       }, []);
       useEffect(() => {
         const onKey = (e) => e.key === "Escape" && setLinkStep(null);
