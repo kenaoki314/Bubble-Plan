@@ -205,6 +205,9 @@
     };
     const memberOf = (t, z) => t.zoneId === z.id && insideZone(t, z);
     const fmtH = (h) => (Math.round(h * 4) / 4).toString().replace(/\.0+$/, "");
+    const toISODate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    const dateInDays = (n) => { const d = new Date(); d.setDate(d.getDate() + n); return toISODate(d); };
+    const daysUntil = (iso) => Math.round((new Date(iso + "T00:00:00").getTime() - new Date().setHours(0, 0, 0, 0)) / DAY_MS);
     const capturePointer = (el, id) => { try { el.setPointerCapture(id); } catch (e) { /* pointer already gone */ } };
 
     function dueInfo(task, now) {
@@ -327,6 +330,10 @@
       const [dragging, setDragging] = useState(false);
       const [subsOpen, setSubsOpen] = useState(false);
       const [subText, setSubText] = useState("");
+      const subInputRef = useRef(null);
+      // Opening the subtasks section puts the caret in the input right away —
+      // toggle open and just start typing.
+      useEffect(() => { if (subsOpen) subInputRef.current?.focus(); }, [subsOpen]);
       const due = dueInfo(task, now);
 
       const subs = task.subtasks || [];
@@ -443,6 +450,7 @@
                   </div>
                 ))}
                 <input
+                  ref={subInputRef}
                   value={subText}
                   onChange={(e) => setSubText(e.target.value)}
                   onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addSub(); } }}
@@ -633,8 +641,22 @@
       const [description, setDescription] = useState(initial?.description || "");
       const [priority, setPriority] = useState(initial?.priority || "medium");
       const [estimate, setEstimate] = useState(initial?.estimateH > 0 ? String(initial.estimateH) : "");
+      // Due date has two entry modes: "days" (default) takes a count of days
+      // from today, "date" takes a calendar date. Both feed the same dueDate.
+      const [dueMode, setDueMode] = useState("days");
       const [dueDate, setDueDate] = useState(initial?.dueDate || "");
+      const [dueDays, setDueDays] = useState(initial?.dueDate ? String(daysUntil(initial.dueDate)) : "");
       const titleRef = useRef(null);
+
+      const onDaysChange = (v) => {
+        setDueDays(v);
+        const n = parseInt(v, 10);
+        setDueDate(Number.isFinite(n) ? dateInDays(n) : "");
+      };
+      const onDateChange = (v) => {
+        setDueDate(v);
+        setDueDays(v ? String(daysUntil(v)) : "");
+      };
 
       useEffect(() => {
         titleRef.current?.focus();
@@ -674,8 +696,28 @@
                 <input type="number" min="0" step="0.25" value={estimate} onChange={(e) => setEstimate(e.target.value)} placeholder="e.g. 1.5" className={inputCls} />
               </div>
               <div>
-                <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1.5">Due date <span className="text-gray-300 dark:text-slate-600">(optional)</span></label>
-                <input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} className={`${inputCls} text-gray-600 dark:text-slate-300`} />
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-xs font-medium text-gray-500 dark:text-slate-400">Due date</label>
+                  <button
+                    type="button"
+                    onClick={() => setDueMode((m) => (m === "days" ? "date" : "days"))}
+                    title={dueMode === "days" ? "Switch to picking a calendar date" : "Switch to entering days from now"}
+                    className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-gray-100 text-gray-500 hover:bg-blue-50 hover:text-blue-500 dark:bg-slate-800 dark:text-slate-400 dark:hover:bg-blue-500/15 dark:hover:text-blue-300 transition-colors"
+                  >
+                    {dueMode === "days" ? "⇄ date" : "⇄ days"}
+                  </button>
+                </div>
+                {dueMode === "days" ? (
+                  <input
+                    type="number" min="0" step="1" value={dueDays}
+                    onChange={(e) => onDaysChange(e.target.value)}
+                    placeholder="days from now"
+                    title={dueDate ? "Due " + dueDate : "How many days from today it's due"}
+                    className={inputCls}
+                  />
+                ) : (
+                  <input type="date" value={dueDate} onChange={(e) => onDateChange(e.target.value)} className={`${inputCls} text-gray-600 dark:text-slate-300`} />
+                )}
               </div>
             </div>
 
@@ -1541,21 +1583,47 @@
       };
 
       /* ---- task ops ---- */
-      const addTask = (fields, zoneId) => {
+      // `at` (canvas point, from the N/T hotkeys) drops the card right under
+      // the cursor — landing inside a zone joins that zone. Without it (the
+      // "+ New Task" button) the card lands in empty space near the view
+      // center, never inside a zone.
+      const addTask = (fields, zoneId, at) => {
         const cardH = measureHeights();
         const c = viewCenter();
         const jitter = () => (Math.random() - 0.5) * 240;
         setData((d) => {
           const z = zoneId ? d.zones.find((zz) => zz.id === zoneId) : null;
+          const w = (PRIORITIES[fields.priority] || PRIORITIES.medium).width;
           let x, y;
           if (z) {
             // stack under the zone's current tasks — fitZones grows the box
             const m = d.tasks.filter((t) => !t.completed && t.zoneId === z.id);
             x = z.x + ZONE_PAD;
             y = m.length ? Math.max(...m.map((t) => t.y + (cardH[t.id] || 220))) + 45 : z.y + ZONE_HEADER + 20;
+          } else if (at) {
+            // the card's zone-membership point (its center) lands on the
+            // cursor, so zoneIdAt below joins whatever zone the cursor is in
+            x = at.x - w / 2;
+            y = at.y - 90;
           } else {
-            x = c.x - 180 + jitter();
+            x = c.x - w / 2 + jitter();
             y = c.y - 90 + jitter();
+            // keep the whole card clear of every zone box — if the spot near
+            // the view center is taken, spiral outward to the nearest gap
+            const clear = (px, py) => !d.zones.some((zz) =>
+              px < zz.x + zz.w + 30 && zz.x < px + w + 30 && py < zz.y + zz.h + 30 && zz.y < py + 220 + 30
+            );
+            if (!clear(x, y)) {
+              search: for (let r = 150; r < 9000; r += 120) {
+                const steps = Math.max(8, Math.floor(r / 80));
+                for (let s = 0; s < steps; s++) {
+                  const a = (2 * Math.PI * s) / steps;
+                  const nx = clamp(c.x + r * Math.cos(a) - w / 2, 0, CANVAS.width - 420);
+                  const ny = clamp(c.y + r * Math.sin(a) * 0.85 - 90, 0, CANVAS.height - 240);
+                  if (clear(nx, ny)) { x = nx; y = ny; break search; }
+                }
+              }
+            }
           }
           const t = {
             id: uid(), ...fields,
@@ -2081,7 +2149,7 @@
           const h = hotkeys.current;
           if (h.busy) return;
           const k = e.key.toLowerCase();
-          if (k === "n" || k === "t") { e.preventDefault(); setModal({}); }
+          if (k === "n" || k === "t") { e.preventDefault(); setModal({ at: h.cursorPoint() }); }
           else if (k === "l") { if (h.canLink) { e.preventDefault(); setLinkStep((s) => (s ? null : "from")); } }
           else if (k === "z") { e.preventDefault(); h.addZone(h.cursorPoint()); }
           else if (k === "a") { if (h.canArrange) { e.preventDefault(); h.autoArrange(); } }
@@ -2132,7 +2200,7 @@
             <HeaderBtn onClick={() => { setShowStats((v) => !v); }} active={showStats} title="Daily velocity and workload stats">Stats</HeaderBtn>
             <HeaderBtn onClick={() => setShowDone((v) => !v)} active={showDone} title="Completed tasks">✓ {done.length}</HeaderBtn>
             <HeaderBtn onClick={() => setDark((v) => !v)} title={dark ? "Switch to light mode" : "Switch to dark mode"}>{dark ? "☀️" : "🌙"}</HeaderBtn>
-            <button onClick={() => setModal({})} title="Add a task (N)" className="ml-1 px-4 py-1.5 text-[13px] font-semibold rounded-full bg-blue-500 text-white hover:bg-blue-600 transition-colors shadow-sm">+ New Task</button>
+            <button onClick={() => setModal({})} title="Add a task in open space (N or T drops it at the cursor)" className="ml-1 px-4 py-1.5 text-[13px] font-semibold rounded-full bg-blue-500 text-white hover:bg-blue-600 transition-colors shadow-sm">+ New Task</button>
           </header>
 
           {/* ---------- Link-mode banner ---------- */}
@@ -2226,7 +2294,7 @@
               zoneName={modal.zoneId ? (data.zones.find((z) => z.id === modal.zoneId)?.name || null) : null}
               onSave={(fields) => {
                 if (modal.task) updateTask(modal.task.id, (t) => ({ ...t, ...fields }));
-                else addTask(fields, modal.zoneId);
+                else addTask(fields, modal.zoneId, modal.at);
                 setModal(null);
               }}
               onClose={() => setModal(null)}
